@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import scipy as sp
 
 import numba
 import logging
@@ -11,6 +12,35 @@ from StatisticStore import StatisticStore
 from ImageProcessor import ImageProcessor
 from ImageView import ImageView
 from WorkerView import WorkerView
+
+
+@numba.jit(nopython=True, cache=True)
+def computeIouDistancesAsymm(normedGtBoxCoords, normedBoxCoords):
+
+    distances = np.full(
+        (normedGtBoxCoords.shape[0], normedBoxCoords.shape[0]), np.nan, dtype=np.float32
+    )
+
+    for left in range(distances.shape[0]):
+        x1l, x2l, y1l, y2l = normedGtBoxCoords[left]
+        # distances[left, left] = np.nan
+        for right in range(left + 1, distances.shape[1]):
+            x1r, x2r, y1r, y2r = normedBoxCoords[right]
+            # Maximised @ 1 when IoU = 0, i.e. no overlap
+            distances[left, right] = 1.0 - (
+                (
+                    max(0, min(x2l, x2r) - max(x1l, x1r))
+                    * max(0, min(y2l, y2r) - max(y1l, y1r))
+                )
+                / (
+                    max(
+                        1e-8,
+                        (max(x2l, x2r) - min(x1l, x1r))
+                        * (max(y2l, y2r) - min(y1l, y1r)),
+                    )
+                )
+            )
+    return distances
 
 
 @numba.jit(nopython=True, cache=True)
@@ -145,35 +175,57 @@ class BoxAggregator:
         shared=dict(max_num_ground_truths=20),
     )
 
+    defaultInitPhaseParams = dict(
+        required_multiplicity_fraction=0.1, required_overlap_fraction=0.6
+    )
+
+    defaultFilterParams = dict(min_images_per_worker=10, min_workers_per_image=5)
+
+    defaultLossParams = dict(false_pos_loss=1, false_neg_loss=1, required_accuracy=0.2)
+
+    boxCoordCols = ["x1", "x2", "y1", "y2"]
+    normedBoxCoordCols = ["x1_normed", "x2_normed", "y1_normed", "y2_normed"]
+
     def __init__(
         self,
         dataBatch,
         filterInputData=True,
-        filterParams=dict(min_images_per_worker=10, min_workers_per_image=5),
-        initPhaseParams=dict(
-            required_multiplicity_fraction=0.1, required_overlap_fraction=0.6
-        ),
+        filterParams=None,
+        initPhaseParams=None,
+        lossParams=None,
         datasetWidePriorInitialValues=None,
         datasetWidePriorParameters=None,
     ):
+
+        self.datasetWidePriorInitialValues = (
+            BoxAggregator.defaultDatasetWidePriorInitialValues
+        )
+        if datasetWidePriorInitialValues is not None:
+            self.datasetWidePriorInitialValues.update(datasetWidePriorInitialValues)
+
+        self.datasetWidePriorParameters = (
+            BoxAggregator.defaultDatasetWidePriorParameters
+        )
+        if datasetWidePriorInitialValues is not None:
+            self.datasetWidePriorParameters.update(datasetWidePriorParameters)
+
+        self.initPhaseParameters = BoxAggregator.defaultInitPhaseParams
+        if initPhaseParams is not None:
+            self.initPhaseParameters.update(initPhaseParams)
+
+        self.filterParams = BoxAggregator.defaultFilterParams
+        if filterParams is not None:
+            self.filterParams.update(filterParams)
+
+        self.lossParams = BoxAggregator.defaultLossParams
+        if lossParams is not None:
+            self.lossParams.update(lossParams)
+
         self.dataBatch = (
             self.filterInputData(dataBatch, filterParams)
             if filterInputData
             else dataBatch
         )
-
-        self.datasetWidePriorInitialValues = (
-            datasetWidePriorInitialValues
-            if datasetWidePriorInitialValues is not None
-            else BoxAggregator.defaultDatasetWidePriorInitialValues
-        )
-        self.datasetWidePriorParameters = (
-            datasetWidePriorParameters
-            if datasetWidePriorParameters is not None
-            else BoxAggregator.defaultDatasetWidePriorParameters
-        )
-
-        self.initPhaseParameters = initPhaseParams
 
         # Class that implements image-specific computations
         self.imageProcessor = ImageProcessor()
@@ -275,8 +327,6 @@ class BoxAggregator:
 
     def mergeAssociations(self):
         ## Compute average bounding boxes from all boxes associated with a particular ground truth.
-        boxCoordCols = ["x1", "x2", "y1", "y2"]
-        normedBoxCoordCols = ["x1_normed", "x2_normed", "y1_normed", "y2_normed"]
 
         # Can work on a per image basis. Group annotations into image-specific
         # association groups.
@@ -289,15 +339,22 @@ class BoxAggregator:
 
         # For each group, compute a "mean box". The accuracy of each associated annotation
         # will be evaluated by computing 1-IoU with this "mean box".
-        self.groundTruthBoxCoords = (
-            boxGrouper[boxCoordCols + ["variance", "image_width", "image_height"]]
-            .apply(lambda group: pd.Series(mergeAssociationsImpl(group.to_numpy())))
-            .to_numpy()
+        self.groundTruthBoxCoordsFrame = boxGrouper[
+            BoxAggregator.boxCoordCols + ["variance", "image_width", "image_height"]
+        ].apply(lambda group: pd.Series(mergeAssociationsImpl(group.to_numpy())))
+        self.groundTruthBoxCoordsFrame.columns = (
+            self.boxCoordCols + self.normedBoxCoordCols
         )
+        self.groundTruthBoxCoords = self.groundTruthBoxCoordsFrame.to_numpy()
+        # Store image IDs associated with GT boxes. Needed for false negative
+        # count prediction.
+        self.groundTruthBoxImageIds = boxGrouper.first().index.get_level_values(0)
 
         # Compute the size of each group associated with a "mean box".
         # This will be used to determine which annotations should be compared
         # with each "mean box" for JIT-compiled distance computation.
+        # Note: choice of group worker_id column is somewhat arbitrary, but
+        # ensures no NaNs
         self.groundTruthIndexSetSizes = boxGrouper.count().worker_id.to_numpy()
 
         # Extract the box coordinates for all annotations not associated
@@ -306,7 +363,7 @@ class BoxAggregator:
         # grouper sorting.
         self.annotationBoxCoords = associatedBoxes.sort_values(
             by=["image_id", "association"]
-        )[boxCoordCols]
+        )[BoxAggregator.boxCoordCols]
 
     def computeWorkerSkills(self, worker, verbose=False):
         # worker annotations
@@ -468,16 +525,15 @@ class BoxAggregator:
 
     def computeImageAndLabelParameters(self, image):
         annos = image.getAnnotations()
-        annoIndices = image.getAnnotationIndices()
+        # annoIndices = image.getAnnotationIndices()
 
         # Only consider annotations that match a ground truth
         matchingAnnos = annos.loc[annos.matches_ground_truth, :]
-        numMatchingAnnos = matchingAnnos.shape[0]
+        # numMatchingAnnos = matchingAnnos.shape[0]
 
         unmatchedAnnos = annos[~annos.matches_ground_truth]
 
         # Image part (image-based variance only)
-
         priorFactor = (
             image.getVariancePrior()
             * self.datasetWidePriorParameters["image_difficulty"]["nInv_chisq_variance"]
@@ -486,11 +542,16 @@ class BoxAggregator:
         varWeightComplement = 1 - matchingAnnos.variance_weighting
 
         imageVariance = (
-            varWeightComplement
+            priorFactor
             + (
                 np.nansum(
-                    matchingAnnos.ground_truth_distance ** 2
-                    + self.statStore.imageStatistics.loc[image.imageId, "box_variance"]
+                    varWeightComplement
+                    * (
+                        matchingAnnos.ground_truth_distance ** 2
+                        + self.statStore.imageStatistics.loc[
+                            image.imageId, "box_variance"
+                        ]
+                    )
                 )
             )
         ) / (
@@ -498,7 +559,7 @@ class BoxAggregator:
             + self.datasetWidePriorParameters["image_difficulty"]["nInv_chisq_variance"]
         )
 
-        ## TODO: could set image variance in statstore for image stats here.
+        # TODO: could set image variance in statstore for image stats here.
 
         # Label part (Combination of image and worker variances)
         imageModel = np.exp(
@@ -515,7 +576,7 @@ class BoxAggregator:
             newVarWeights * matchingAnnos.variance
         )
 
-        self.statStore.setGroundTruths(
+        self.statStore.setAssociatedBoxes(
             pd.DataFrame(
                 {
                     "image_id": matchingAnnos.image_id,
@@ -553,10 +614,19 @@ class BoxAggregator:
             ),
             imageGroupedAnnotations.groups.keys(),
         )
-        # Step 2: Compute and store worker skill parameters.
+        # Step 2: Compute and store worker skill parameters and map to annotations
         self.statStore.setWorkerSkills(
             np.array([self.computeWorkerSkills(worker) for worker in self.workers])
         )
+        self.annoStore.annotations.false_pos_prob = self.statStore.workerStatistics.false_pos_prob.loc[
+            self.annoStore.annotations.worker_id
+        ].to_numpy()
+        self.annoStore.annotations.false_neg_prob = self.statStore.workerStatistics.false_neg_prob.loc[
+            self.annoStore.annotations.worker_id
+        ].to_numpy()
+        self.annoStore.annotations.variance = self.statStore.workerStatistics.variance.loc[
+            self.annoStore.annotations.worker_id
+        ].to_numpy()
         # Step 3: Compute and store image and label likelihood parameters
         # Note that "label" refers to the set of boxes provided by a specific
         # worker for a specific image.
@@ -670,8 +740,9 @@ class BoxAggregator:
         groundTruthAnnos = self.annoStore.annotations.loc[
             self.annoStore.annotations.is_ground_truth
         ]
+
         imageGroupedGroundTruths = (
-            self.statStore.groundTruthStatistics.reset_index(level=0)
+            self.statStore.associatedBoxStatistics.reset_index(level=0)
             .loc[groundTruthAnnos.index]
             .groupby(by="image_id")
         )
@@ -718,7 +789,7 @@ class BoxAggregator:
                 ],
             ]
             .merge(
-                self.statStore.groundTruthStatistics.reset_index(level=0),
+                self.statStore.associatedBoxStatistics.reset_index(level=0),
                 how="left",
                 left_index=True,
                 right_index=True,
@@ -745,9 +816,7 @@ class BoxAggregator:
         print("\tComputing Likelihood Model...")
         return self.computeBatchLikelihood()
 
-    def computeExpNumFalseNegative(
-        self, imageAnnotations
-    ):
+    def computeImageExpNumFalseNegative(self, imageAnnotations):
         # Can only compute false negative probability using data for this image
         # if some boxes were unassociated!
         if (imageAnnotations.association < 0).any():
@@ -781,7 +850,9 @@ class BoxAggregator:
             facilities = np.flatnonzero(fl.fData.data[:, FData.isOpen])
             openFacCosts = openCostSubset[facilities]
             cityConnectCosts = connectionCostSubset[1:, 1:][
-                np.ix_(facilities, np.isin(fl.cData.data[:, CData.facility], facilities))
+                np.ix_(
+                    facilities, np.isin(fl.cData.data[:, CData.facility], facilities)
+                )
             ]
 
             # Cost for assigning TP label
@@ -805,6 +876,234 @@ class BoxAggregator:
             return expectedNumFalseNeg
 
         return 0
+
+    def computeExpNumFalseNegative(self):
+        # Compute IoU distance between ground truths and all boxes in this batch
+        self.bigBBoxDistances = computeIouDistancesAsymm(
+            self.groundTruthBoxCoords[:, 4:],
+            self.annoStore.annotations.loc[
+                :, BoxAggregator.normedBoxCoordCols
+            ].to_numpy(),
+        )
+        # Find all boxes in the global set that do not intersect with a particular
+        # ground truth box.
+        # NOTE: Raises warning because bigBBoxDistances intentionally contains NaN
+        # values (so comparison always returns false)
+        self.bigBBoxMisses = (
+            np.nan_to_num(self.bigBBoxDistances, 2)
+            > self.initPhaseParameters["required_overlap_fraction"]
+        )
+
+        # The global set approximates the probability that any position in any
+        # image contains a target object e.g. all likely targets may be
+        # concentrated in the centre of the image.
+
+        # Every global box that doesn't intersect with a ground truth box for
+        # this image increases the probability that there is a real box missing
+        # from the current ground truth estimate.
+
+        # If the worker that provided the global box has a high false positive
+        # probability, then this increases the chance that the missed
+        # intersection implies a missed target.
+
+        # If the cost of identifying the ground truth box as a target was high,
+        # then this reduces the chance that the missed intersection implies a
+        # missed target.
+
+        # Recall that the cost is the sum of negated log false negative
+        # probabilities over all workers who annotated the image corresponding
+        # to a particluar box i.e. a higher cost implies many workers with a
+        # low false negative probability annotated the image.
+        self.bigBBoxMissContributions = (
+            pd.DataFrame(self.bigBBoxMisses)
+            .groupby(by=self.groundTruthBoxImageIds)
+            .apply(
+                lambda grp, fpp, oc: np.sum(
+                    np.all(grp, axis=0) * (fpp) * np.exp(-oc.false_neg_prob)
+                ),
+                self.annoStore.annotations.false_pos_prob,
+                self.openCosts,
+            )
+        )
+
+        imageGroupedAnnotations = self.annoStore.annotations.groupby(by="image_id")
+
+        # Compute expected false negatives based on annotations for particular
+        # images.
+        expNumFalseNegative = imageGroupedAnnotations.apply(
+            self.computeImageExpNumFalseNegative
+        )
+
+        # Combine image-specific false negative count expectation with global
+        # expectation.
+        expNumFalseNegative.loc[
+            self.bigBBoxMissContributions.index
+        ] += self.bigBBoxMissContributions
+
+        self.statStore.setImageExpNumFalseNegative(
+            expNumFalseNegative, expNumFalseNegative.index
+        )
+
+    def computeExpNumFalsePositive(self):
+        # Get a reference to all ground annotations that match a ground truth.
+        matchingAnnos = self.annoStore.annotations.loc[
+            self.annoStore.annotations.matches_ground_truth
+        ]
+        # Compute a set of workers who matched each ground truth
+        matchingWorkers = (
+            matchingAnnos.groupby(by=["image_id", "association"])
+            .worker_id.apply(set)
+            .reset_index(level=1)
+        )
+
+        # Compute a set of workers who saw the image and had an opportunity
+        # to mark thr ground truth
+        possibleWorkers = matchingAnnos.groupby(by="image_id").worker_id.apply(set)
+
+        combinedWorkers = matchingWorkers.merge(
+            possibleWorkers,
+            how="left",
+            left_index=True,
+            right_index=True,
+            suffixes=["_matched", "_possible"],
+        )
+
+        # Compute a set of workers who missed each ground truth
+        combinedWorkers["worker_id_missed"] = (
+            combinedWorkers.worker_id_possible - combinedWorkers.worker_id_matched
+        )
+        # Retrieve the false positive probabilities for workers that matched each ground truth
+        combinedWorkers[
+            "false_neg_prob_missed"
+        ] = combinedWorkers.worker_id_missed.apply(
+            lambda ids: self.statStore.workerStatistics.loc[
+                ids, "false_neg_prob"
+            ].to_numpy()
+        )
+        # Compute the complement of the probabilities that were just retrieved
+        # i.e. the true negative probability for workers who missed.
+        combinedWorkers[
+            "false_neg_prob_missed_complement"
+        ] = combinedWorkers.false_neg_prob_missed.apply(lambda probs: 1 - probs)
+
+        # Retrieve the false negative probabilities for workers that matched each ground truth
+        combinedWorkers[
+            "false_pos_prob_matched"
+        ] = combinedWorkers.worker_id_matched.apply(
+            lambda ids: self.statStore.workerStatistics.loc[
+                ids, "false_pos_prob"
+            ].to_numpy()
+        )
+        # Compute the complement of the probabilities that were just retrieved
+        # i.e. the true positive probability for workers who matched.
+        combinedWorkers[
+            "false_pos_prob_matched_complement"
+        ] = combinedWorkers.false_pos_prob_matched.apply(lambda probs: 1 - probs)
+
+        # Compute the probability that each ground truth is a true positive
+        # This is the product of the false negative probability for all workers that missed
+        # and the complement of the false positive probability i.e. the true positive
+        # probability for all workers that matched.
+        combinedWorkers[
+            "assoc_true_pos_prob"
+        ] = combinedWorkers.false_pos_prob_matched_complement.apply(
+            np.product
+        ) * combinedWorkers.false_neg_prob_missed.apply(
+            np.product
+        )
+
+        # Compute the probability that this ground truth is a false positive
+        # This is the product of the false postive probability for all workers that matched
+        # and the complement of the false negative probability i.e. the true negative
+        # probability for all workers that missed.
+        combinedWorkers[
+            "assoc_false_pos_prob"
+        ] = combinedWorkers.false_neg_prob_missed_complement.apply(
+            np.product
+        ) * combinedWorkers.false_pos_prob_matched.apply(
+            np.product
+        )
+        # Compute the contribution of each ground truth to the expected count of false
+        # positives for its associated image.
+        # Computed as the false pos probability divided by the probability that the
+        # ground truth is identified.
+        combinedWorkers["false_pos_prob"] = combinedWorkers.assoc_false_pos_prob / (
+            combinedWorkers.assoc_false_pos_prob + combinedWorkers.assoc_true_pos_prob
+        )
+
+        # Compute the expected number of false positives for each image by summing
+        # the contributions of each identified ground truth.
+        expNumFalsePositive = (
+            combinedWorkers.reset_index()
+            .groupby(by=["image_id"])
+            .false_pos_prob.sum()
+            # .reindex(self.annoStore.annotations.image_id.unique())
+            # .fillna(0)
+        )
+
+        self.statStore.setImageExpNumFalsePositive(
+            expNumFalsePositive, expNumFalsePositive.index
+        )
+
+        return combinedWorkers.loc[:, ["association", "false_pos_prob"]].set_index(
+            "association", append=True
+        )
+
+    def computeExpNumInaccurate(self):
+        """
+        To estimate the number of ground truth boxes with a variance exceeding some threshold
+        distance model the ground truth position as a sample from a Gaussian distribution
+        with zero mean and variance $\sigma^{2}$ given by the sum of combined (worker + image) variances
+        for each box associated with the ground truth.
+
+        In this case, the probability that the error associated with the ground truth box
+        position exceeds $\pm \delta$ is given by $\mathrm{erfc}\left(\frac{\delta}{\sqrt{2\sigma^{2}}}\right)$.
+
+        Note that the variances are expressed in 1-IoU coordinates and are therefore ounded in the range $[0,1]$
+        """
+        # Step 0: Get a reference to all ground annotations that match a ground truth.
+        matchingAnnos = self.annoStore.annotations.loc[
+            self.annoStore.annotations.matches_ground_truth
+        ]
+
+        # Step 1: Extract the combined variances for the annotations that match a ground truth
+        matchingGroundTruthStats = (
+            self.statStore.associatedBoxStatistics.reset_index(level=0)
+            .loc[matchingAnnos.index]
+            .set_index("image_id", append=True)
+        )
+        combinedVariances = matchingGroundTruthStats.combined_variance
+
+        # Step 2: Group the extracted variances according to the image and ground truth association
+        # within that image to which they pertain and sum them to obtain an estimate of the overall
+        # variance of the ground truth box.
+        summedCombinedVariances = combinedVariances.groupby(
+            by=[
+                self.annoStore.annotations.loc[
+                    matchingAnnos.index, "image_id"
+                ].to_numpy(),
+                self.annoStore.annotations.loc[
+                    matchingAnnos.index, "association"
+                ].to_numpy(),
+            ]
+        ).sum()
+
+        # Step 3: Compute the probability that each the positional error on each ground truth
+        # exceeds a threshold overlap fraction.
+        groundTruthInaccurateProbs = sp.special.erfc(
+            (1 - self.lossParams["required_accuracy"])
+            / np.sqrt(2 * summedCombinedVariances)
+        )
+
+        # Step 4: Compute the expected number of ground truth boxes in each image with positional
+        # error that exceeds the threshold overlap fraction by summing the probabilities that each
+        # ground truth box associated with the image does so.
+        expectedNumInaccurate = groundTruthInaccurateProbs.groupby(level=0).sum()
+        self.statStore.setImageExpNumInaccurate(
+            expectedNumInaccurate, expectedNumInaccurate.index
+        )
+
+        return groundTruthInaccurateProbs.rename("inaccurate_prob")
 
     def processBatch(self):
         # ** Once-per-batch computations
@@ -855,21 +1154,63 @@ class BoxAggregator:
         previousLikelihood = -np.inf
         for batchStep in range(10):
             print(f"Batch processing iteration {batchStep}...")
+            self.statStore.resetAssociatedBoxes()
+            self.statStore.resetGroundTruths()
             currentLikelihood = self.processBatchStep(init=False)
             if currentLikelihood <= previousLikelihood:
                 print(f"Converged @ {currentLikelihood}")
                 break
             else:
-                print(f"Not Converged @ {currentLikelihood} (Previous: {previousLikelihood})")
+                print(
+                    f"Not Converged @ {currentLikelihood} (Previous: {previousLikelihood})"
+                )
                 previousLikelihood = currentLikelihood
 
-        # Step 6: Compute expected number of false negatives for all images.
-        print("Computing per-image expected false negative counts...")
-        imageGroupedAnnotations = self.annoStore.annotations.groupby(by="image_id")
+        # Step 6: Compute risks for all images.
+        print("\tComputing risks...")
+        # Step 6a: Compute expected number of false negatives for all images.
+        print("\t\tComputing per-image expected false negative counts...")
+        self.computeExpNumFalseNegative()
 
-        self.statStore.setImageExpNumFalseNegative(
-            imageGroupedAnnotations.apply(
-                self.computeExpNumFalseNegative
-            ),
-            imageGroupedAnnotations.groups.keys(),
+        # Step 6b: Compute expected number of false positives for all images.
+        print("\t\tComputing per-image expected false positive counts...")
+        gtFalsePosProbs = self.computeExpNumFalsePositive()
+
+        # Step 6c: Compute expected variance of (assumed) true positive annotations.
+        print("\t\tComputing per-image expected innacurate positive counts...")
+        gtInaccurateProbs = self.computeExpNumInaccurate()
+
+        # Step 6d: Compute image risks
+        groundTruthRisks = self.lossParams["false_pos_loss"] * (
+            gtFalsePosProbs.false_pos_prob
+            + (
+                gtInaccurateProbs
+                * (
+                    self.lossParams["false_neg_loss"]
+                    + (1 - gtFalsePosProbs.false_pos_prob)
+                    * self.lossParams["false_pos_loss"]
+                )
+            )
+        ).rename("risk")
+
+        # Step 6e: Save individual ground truth box statistics
+        self.statStore.setGroundTruths(
+            pd.concat(
+                [gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks], axis=1
+            ).reset_index()
         )
+
+        # Step 6f: Compute per image risks
+        imageRisks = (
+            groundTruthRisks.groupby(level=0)
+            .sum()
+            .reindex_like(self.statStore.imageStatistics)
+            .fillna(0)
+        )
+
+        imageRisks += (
+            self.statStore.imageStatistics.loc[:, "expected_num_false_neg"]
+            * self.lossParams["false_neg_loss"]
+        )
+        # Step 6g: Save per image risks
+        self.statStore.setImageRisk(imageRisks, imageRisks.index)
