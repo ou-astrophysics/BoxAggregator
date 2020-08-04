@@ -843,26 +843,37 @@ class BoxAggregator:
                 openCostSubset,
                 connectionCostSubset[1:, 1:],  # excludes dummy
                 self.disallowedConnectionMask.to_numpy()[selector][1:, 1:].astype(bool),
-                logging.WARNING,  # if imageId != 36718140 else logging.INFO,
+                logging.WARNING,
             )
             fl.solve(fcPairs=fcPairs, haveDummy=False)
 
+            # open facilities
             facilities = np.flatnonzero(fl.fData.data[:, FData.isOpen])
             openFacCosts = openCostSubset[facilities]
-            cityConnectCosts = connectionCostSubset[1:, 1:][
-                np.ix_(
-                    facilities, np.isin(fl.cData.data[:, CData.facility], facilities)
-                )
+            # cities connected to open facilities are True
+            cityConnectedIndicator = np.flatnonzero(np.isin(
+                fl.cData.data[:, CData.facility], facilities
+            ))
+            cityConnectCosts = connectionCostSubset[1:, 1:][  # excluding dummy
+                np.ix_(facilities, cityConnectedIndicator)
             ]
-
-            # Cost for assigning TP label
+            # Cost for assigning TP label i.e cost of opening + summed cost
+            # of connections.
             truePosConnectCosts = np.nansum(cityConnectCosts, axis=1) + openFacCosts
 
             # Cost for retaining original FP label (connecting cities to dummy)
+            # i.e. sum of connection costs to dummy facility (open cost is 0)
+
+            # which cities want to connect to all open facilities?
+            cityConnectedIndicator2d = np.nan_to_num(cityConnectCosts) > 0
+            # How much does it cost them to connect to the dummy instead?
+            cityConnectCostsDummy = connectionCostSubset[:, 1:][
+                0, np.isin(fl.cData.data[:, CData.facility], facilities)
+            ]
+            # project costs along facility axis and sum along city axis
             falsePosConnectCosts = (
-                np.count_nonzero(np.nan_to_num(cityConnectCosts), axis=1)
-                * connectionCostSubset[facilities + 1, 0]
-            )
+                cityConnectedIndicator2d * cityConnectCostsDummy
+            ).sum(axis=1)
 
             maxConnectCost = np.maximum(truePosConnectCosts, falsePosConnectCosts)
 
@@ -881,14 +892,12 @@ class BoxAggregator:
         # Compute IoU distance between ground truths and all boxes in this batch
         self.bigBBoxDistances = computeIouDistancesAsymm(
             self.groundTruthBoxCoords[:, 4:],
-            self.annoStore.annotations.loc[
-                :, BoxAggregator.normedBoxCoordCols
-            ].to_numpy(),
+            self.bigBBoxSet.loc[:, BoxAggregator.normedBoxCoordCols].to_numpy(),
         )
         # Find all boxes in the global set that do not intersect with a particular
         # ground truth box.
-        # NOTE: Raises warning because bigBBoxDistances intentionally contains NaN
-        # values (so comparison always returns false)
+        # NOTE: Previously raised warning because bigBBoxDistances intentionally
+        # contains NaN values (so comparison wouldf always return false)
         self.bigBBoxMisses = (
             np.nan_to_num(self.bigBBoxDistances, 2)
             > self.initPhaseParameters["required_overlap_fraction"]
@@ -921,7 +930,7 @@ class BoxAggregator:
                 lambda grp, fpp, oc: np.sum(
                     np.all(grp, axis=0) * (fpp) * np.exp(-oc.false_neg_prob)
                 ),
-                self.annoStore.annotations.false_pos_prob,
+                self.bigBBoxSet.false_pos_prob,
                 self.openCosts,
             )
         )
@@ -933,6 +942,8 @@ class BoxAggregator:
         expNumFalseNegative = imageGroupedAnnotations.apply(
             self.computeImageExpNumFalseNegative
         )
+
+        self.expNumFalseNegativeImage = expNumFalseNegative.copy()
 
         # Combine image-specific false negative count expectation with global
         # expectation.
@@ -1120,6 +1131,7 @@ class BoxAggregator:
         exclusiveIndices = np.concatenate(
             list(self.annoStore.getMultiIndexGroupedAnnotations().indices.values())
         )
+
         # Actual computation is delegated to a numba jit-compiled function
         self.disallowedConnectionMask = pd.DataFrame(
             computeDisallowedConnectionMask(
@@ -1131,17 +1143,38 @@ class BoxAggregator:
         # Step 3: Compute global box overlap statistics for later use computing
         # risk.
         print("Computing global box overlap statistics...")
-        shuffledDistances = self.imageProcessor.getIouDistances(
+        shuffledDistances, shuffledIndex = self.imageProcessor.getIouDistances(
             store=None, shuffle=True
         )
         overlaps = (
             shuffledDistances < self.initPhaseParameters["required_overlap_fraction"]
         )
-        overlapCounts = overlaps.sum(axis=1) + 1
-        falsePosProbs = (overlapCounts / overlapCounts.size).rename("false_pos_prob")
+        # POSSIBLE ERROR HERE: Only one intersection per worker allowed
+        workerGroupedOverlaps = overlaps.groupby(
+            by=self.annoStore.annotations.worker_id.loc[shuffledIndex]
+        )
+
+        falsePosProbs = (
+            workerGroupedOverlaps.apply(
+                lambda x: np.any(
+                    x, axis=0
+                )  # any worker box intersects a gt box (hoping for short-circuit logic)
+            ).sum(
+                axis=0  # count number of workers that hit the gt box
+            )
+            / self.annoStore.annotations.worker_id.nunique()
+        ).rename("false_pos_prob")
+
         self.bigBBoxSet = self.annoStore.annotations[
-            ["x1_normed", "x2_normed", "y1_normed", "y2_normed"]
-        ].merge(falsePosProbs, left_index=True, right_index=True)
+            [
+                "x1_normed",
+                "x2_normed",
+                "y1_normed",
+                "y2_normed",
+                "worker_id",
+                "image_id",
+            ]
+        ].merge(falsePosProbs, how="left", left_index=True, right_index=True)
 
         # Step 4:
         # ** Initial batch processing

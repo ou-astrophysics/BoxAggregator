@@ -67,6 +67,5 @@ class ImageProcessor:
 
         if shuffle:
             permutedIndex = np.random.permutation(distances.index)
-            return distances.loc[permutedIndex, permutedIndex]
+            return distances.loc[permutedIndex, permutedIndex], permutedIndex
         return distances
-    
