@@ -1,8 +1,20 @@
 import pandas as pd
 import numpy as np
 
+from SaveableStore import SaveableStore
 
-class AnnotationStore:
+
+class AnnotationStore(SaveableStore):
+
+    saveableAttrs = [
+        "indexCols",
+        "annotations",
+        "indices",
+        "indexGroupedAnnotations",
+        "indexGroupedAnnotationCounts",
+        "multiIndexGroupedAnnotations",
+    ]
+
     def __init__(self, indexCols=["image_id", "worker_id"]):
         self.indexCols = indexCols
         self.annotations = pd.DataFrame()
@@ -37,9 +49,15 @@ class AnnotationStore:
                                 combined_variance=priors["shared"]["variance"],
                                 variance_weighting=0.5,  # balance between worker and image variance
                                 association=None,
+                                connection_cost=np.nan,
                                 is_ground_truth=False,
+                                is_cleanup_ground_truth=False,
+                                is_pruned=False,
+                                is_merged=False,
+                                prune_distance=np.nan,
                                 matches_ground_truth=False,
                                 ground_truth_distance=np.nan,
+                                multiplicity_weights=1,
                             ),
                             index=annotations.index,
                         ),
@@ -61,13 +79,16 @@ class AnnotationStore:
         return self.annotations.values
 
     def getAnnotationSubset(self, indexCol=None, indexKey=None):
-        return self.annotations.loc[self.indices[indexCol][indexKey]]
+        return self.annotations.iloc[self.indices[indexCol][indexKey]]
 
     def getIndicesSubset(self, indexCol=None, indexKey=None):
         return self.indices[indexCol][indexKey]
 
+    def getIndexLabelSubset(self, indexCol=None, indexKey=None):
+        return self.annotations.index[self.getIndicesSubset(indexCol, indexKey)]
+
     def getAnnotationsSubsetArray(self, indexCol, indexKey):
-        return self.getAnnotations(indexCol, indexKey).values
+        return self.getAnnotationSubset(indexCol, indexKey).values
 
     def getIndexValues(self, indexCol):
         return self.indices[indexCol].keys()
@@ -111,3 +132,11 @@ class AnnotationStore:
         if rebuild or self.multiIndexGroupedAnnotations is None:
             self.rebuildMultiIndexGroups()
         return self.multiIndexGroupedAnnotations
+
+    def setConnectionCosts(self, connectionCosts, annotations=slice(None)):
+        self.annotations.loc[annotations, "connection_cost"] = connectionCosts
+
+    def resetPruningLabels(self):
+        self.annotations.is_pruned = False
+        self.annotations.is_merged = False
+        self.annotations.prune_distance = np.nan

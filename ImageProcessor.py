@@ -2,17 +2,24 @@ import numba
 import numpy as np
 import pandas as pd
 
+
 @numba.jit(nopython=True)
-def computeIouDistancesImpl(normedBoxCoords):
+def computeIouDistancesImpl(normedBoxCoords, isEmpty):
 
     distances = np.empty(
         (normedBoxCoords.shape[0], normedBoxCoords.shape[0]), dtype=np.float32
     )
 
     for left in range(distances.shape[0]):
-        x1l, x2l, y1l, y2l = normedBoxCoords[left]
         distances[left, left] = np.nan
+        if isEmpty[left]:
+            distances[left, :] = np.nan
+            continue
+        x1l, x2l, y1l, y2l = normedBoxCoords[left]
         for right in range(left + 1, distances.shape[1]):
+            if isEmpty[right]:
+                distances[left, right] = np.nan
+                continue
             x1r, x2r, y1r, y2r = normedBoxCoords[right]
             # Maximised @ 1 when IoU = 0, i.e. no overlap
             distances[left, right] = distances[right, left] = 1.0 - (
@@ -40,13 +47,18 @@ class ImageProcessor:
             normedBoxCoords = image.getAnnotations()[
                 ["x1_normed", "x2_normed", "y1_normed", "y2_normed"]
             ]
+            emptyAnnos = image.getAnnotations()["empty"]
         elif store is not None:
             normedBoxCoords = store.getAnnotations()[
                 ["x1_normed", "x2_normed", "y1_normed", "y2_normed"]
             ]
+            emptyAnnos = store.getAnnotations()["empty"]
 
         distances = pd.DataFrame(
-            computeIouDistancesImpl(normedBoxCoords.values.astype(np.float32)),
+            computeIouDistancesImpl(
+                normedBoxCoords.values.astype(np.float32),
+                emptyAnnos.values.astype(np.bool_),
+            ),
             index=normedBoxCoords.index,
             columns=normedBoxCoords.index,
         )

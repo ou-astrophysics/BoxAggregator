@@ -1,15 +1,25 @@
 import pandas as pd
 import numpy as np
 
+from SaveableStore import SaveableStore
 
-class StatisticStore:
+
+class StatisticStore(SaveableStore):
+
+    saveableAttrs = [
+        "workerStatistics",
+        "imageStatistics",
+        "groundTruthStatistics",
+        "associatedBoxStatistics",
+    ]
+
     def __init__(self):
         self.workerStatistics = pd.DataFrame()
         self.imageStatistics = pd.DataFrame()
         self.resetGroundTruths()
         self.resetAssociatedBoxes()
 
-    def addWorkers(self, annotationStore, priors):
+    def addWorkers(self, annotationStore, priors, priorParams):
         newWorkerIds = pd.Index(
             annotationStore.getAnnotations().worker_id.unique()
         ).difference(self.workerStatistics.index)
@@ -30,12 +40,30 @@ class StatisticStore:
                         false_pos_prob=priors["volunteer_skill"]["false_pos_prob"],
                         false_neg_prob=priors["volunteer_skill"]["false_neg_prob"],
                         variance=priors["volunteer_skill"]["variance"],
+                        num_annos=0,
+                        num_false_pos_trials=priorParams["volunteer_skill"][
+                            "nBeta_false_pos"
+                        ],
+                        num_false_pos=priorParams["volunteer_skill"]["nBeta_false_neg"]
+                        * priors["volunteer_skill"]["false_pos_prob"],
+                        num_false_neg_trials=priorParams["volunteer_skill"][
+                            "nBeta_false_neg"
+                        ],
+                        num_false_neg=priorParams["volunteer_skill"]["nBeta_false_neg"]
+                        * priors["volunteer_skill"]["false_neg_prob"],
+                        num_variance_trials=priorParams["volunteer_skill"][
+                            "nInv_chisq_variance"
+                        ],
+                        variance_numerator=priorParams["volunteer_skill"][
+                            "nInv_chisq_variance"
+                        ]
+                        * priors["volunteer_skill"]["variance"],
                     )
                 ).set_index("worker_id"),
             ]
         )
 
-    def addImages(self, annotationStore, priors):
+    def addImages(self, annotationStore, priors, priorParams):
         newImageIds = pd.Index(
             annotationStore.getAnnotations().image_id.unique()
         ).difference(self.imageStatistics.index)
@@ -57,14 +85,16 @@ class StatisticStore:
                         expected_num_false_pos=0,
                         expected_num_inaccurate=0,
                         risk=np.infty,
+                        open_cost=0,
+                        num_annotations_provided=0,
                     )
                 ).set_index("image_id"),
             ]
         )
 
-    def addAnnotations(self, annotationStore, priors):
-        self.addWorkers(annotationStore, priors)
-        self.addImages(annotationStore, priors)
+    def addAnnotations(self, annotationStore, priors, priorParams):
+        self.addWorkers(annotationStore, priors, priorParams)
+        self.addImages(annotationStore, priors, priorParams)
 
     def setWorkerSkills(self, skills, workers=slice(None)):
         self.workerStatistics.loc[
@@ -93,6 +123,9 @@ class StatisticStore:
     def setImageRisk(self, imageRisk, images=slice(None)):
         self.imageStatistics.loc[images, ["risk"]] = imageRisk
 
+    def setImageOpenCosts(self, openCost, images=slice(None)):
+        self.imageStatistics.loc[images, "open_cost"] = openCost
+
     # Erases all associated box data.
     def resetAssociatedBoxes(self):
         self.associatedBoxStatistics = pd.DataFrame(
@@ -114,8 +147,8 @@ class StatisticStore:
                 "image_id",
                 "association",
                 "false_pos_prob",  # probability that gt is a false pos
-                "innaccurate_prob",  # probability that the gt is inaccurate
-                "risk"
+                "inaccurate_prob",  # probability that the gt is inaccurate
+                "risk",
             ]
         ).set_index(["image_id", "association"])
 
@@ -188,7 +221,7 @@ class StatisticStore:
                             "association",
                             "false_pos_prob",  # probability that gt is a false pos
                             "inaccurate_prob",  # probability that the gt is inaccurate
-                            "risk"
+                            "risk",
                         ],
                     ],
                 ]
