@@ -30,7 +30,7 @@ class WorkerView:
         return self.statisticsStore.workerStatistics.loc[self.workerId, "num_false_neg"]
 
     def getVarianceNumerator(self) -> float:
-        returnself.statisticsStore.workerStatistics.loc[
+        return self.statisticsStore.workerStatistics.loc[
             self.workerId, "variance_numerator"
         ]
 
@@ -100,8 +100,10 @@ class WorkerView:
                 "num_annos",
                 "num_false_pos_trials",
                 "num_false_pos",
+                "num_not_false_pos",
                 "num_false_neg_trials",
                 "num_false_neg",
+                "num_not_false_neg",
                 "num_variance_trials",
                 "variance_numerator",
             ],
@@ -110,8 +112,10 @@ class WorkerView:
                 numAnnos,
                 numFalsePosTrials,
                 numFalsePos,
+                numAnnos - numFalsePos,
                 numFalseNegTrials,
                 numFalseNeg,
+                numAnnos - numFalseNeg,
                 numVarianceTrials,
                 deltaVariance,
             ]

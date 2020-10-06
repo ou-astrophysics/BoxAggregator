@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 from SaveableStore import SaveableStore
+from StatisticStore import StatisticStore
 
 
 class AnnotationStore(SaveableStore):
@@ -23,7 +24,47 @@ class AnnotationStore(SaveableStore):
         self.indexGroupedAnnotationCounts = None
         self.multiIndexGroupedAnnotations = None
 
-    def addAnnotations(self, annotations, priors):
+    def addAnnotations(
+        self, annotations: pd.DataFrame, priors: dict, statisticStore: StatisticStore
+    ) -> None:
+        """Add new annotations to the store. Optionally filter images that are
+        already finished.
+
+        Parameters
+        ----------
+        annotations : pandas.DataFrame
+            A dataframe containing the data for a new batch of annotations.
+        priors : dict
+            Dataset-wide prior values used to initialise values for new
+            annotations.
+        statisticStore : StatisticStore
+            Used to determine whether any annotations apply to images that
+            are already finished and determine skill parameters for workers who
+            contributed to earlier batches.
+
+        Returns
+        -------
+        None
+            Description of returned object.
+
+        """
+        finished = pd.Index([])
+        if statisticStore.imageStatistics.index.size > 0:
+            finished = statisticStore.imageStatistics.loc[
+                :, statisticStore.imageStatistics.is_finished
+            ].index
+            annotations = annotations.groupby(by="image_id").filter(
+                lambda grp: grp.name not in finished
+            )
+
+        # Set worker skills for relevant annotations
+        if statisticStore.workerStatistics.index.size > 0:
+            skillParameterColumns = ["variance", "false_pos_prob", "false_neg_prob"]
+            annotations = annotations.copy(deep=True).set_index("worker_id")
+            annotations.loc[
+                statisticStore.workerStatistics.index, skillParameterColumns
+            ] = statisticStore.workerStatistics[skillParameterColumns]
+
         self.annotations = pd.concat(
             [
                 self.annotations,

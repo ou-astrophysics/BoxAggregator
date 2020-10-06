@@ -7,6 +7,7 @@ import logging
 import itertools
 import pickle
 import os
+import collections
 
 from FacilityLocation import FacilityLocation, FData, CData
 from AnnotationStore import AnnotationStore
@@ -186,6 +187,13 @@ class BoxAggregator:
 
     defaultFilterParams = dict(min_images_per_worker=10, min_workers_per_image=5)
 
+    defaultImageCompletionParams = dict(
+        max_risk=1,
+        max_expected_num_false_pos=0.3,
+        max_expected_num_false_neg=0.3,
+        max_expected_num_inaccurate=0.3,
+    )
+
     defaultLossParams = dict(
         false_pos_loss=1,
         false_neg_loss=1,
@@ -205,8 +213,10 @@ class BoxAggregator:
 
     def __init__(
         self,
-        dataBatch,
-        filterInputData=True,
+        imageCompletionAssessor=None,
+        imageCompletionParams=None,
+        applyInputDataFilter=False,
+        inputDataFilter=None,
         filterParams=None,
         initPhaseParams=None,
         lossParams=None,
@@ -233,9 +243,22 @@ class BoxAggregator:
         if initPhaseParams is not None:
             self.initPhaseParameters.update(initPhaseParams)
 
+        self.applyInputDataFilter = applyInputDataFilter
+        self.inputDataFilter = inputDataFilter
+
         self.filterParams = BoxAggregator.defaultFilterParams
         if filterParams is not None:
             self.filterParams.update(filterParams)
+
+        self.imageCompletionAssessor = (
+            imageCompletionAssessor
+            if imageCompletionAssessor is not None
+            else self.assessImageCompletion
+        )
+
+        self.imageCompletionParams = BoxAggregator.defaultImageCompletionParams
+        if imageCompletionParams is not None:
+            self.imageCompletionParams.update(imageCompletionParams)
 
         self.lossParams = BoxAggregator.defaultLossParams
         if lossParams is not None:
@@ -244,12 +267,6 @@ class BoxAggregator:
         self.assocParams = BoxAggregator.defaultAssocParams
         if assocParams is not None:
             self.assocParams.update(assocParams)
-
-        self.dataBatch = (
-            self.filterInputData(dataBatch, filterParams)
-            if filterInputData
-            else dataBatch
-        )
 
         self.savePath = savePath
         # Computationally expensive, but can be useful for diagnostics
@@ -274,13 +291,55 @@ class BoxAggregator:
             )
         ).reset_index(drop=True)
 
+    def assessImageCompletion(
+        self, imageStats: pd.DataFrame, params: dict
+    ) -> pd.Series:
+        """Simple default image completion assessor checks whether the image
+        statistics corresponding to the keys of params are less than the values
+        of params.
+
+        Parameters
+        ----------
+        imageStats : pd.DataFrame
+            The computed image statistics.
+        params : dict
+            Threshold values for specific named image statistics.
+
+        Returns
+        -------
+        pd.Series
+            True if all statistics for an image are less than their specified
+            threshold values. False otherwise.
+
+        """
+        orderedParams = collections.OrderedDict(params)
+        columns = list(map(lambda key: key.replace("max_", ""), orderedParams.keys()))
+        result = np.all(
+            imageStats.loc[:, columns]
+            < np.fromiter(orderedParams.values(), dtype=float),
+            axis=1,
+        )
+        return result
+
     def setup(self):
         self.annoStore = AnnotationStore()
         self.statStore = StatisticStore()
+        self.batchLikelihoods = []
 
+    def setupNewBatch(self, dataBatch):
+        self.dataBatch = (
+            self.inputDataFilter(dataBatch, self.filterParams)
+            if self.inputDataFilter is not None
+            else self.filterInputData(dataBatch, self.filterParams)
+            if self.applyInputDataFilter
+            else dataBatch
+        )
+        # Add new annotations and initialise with dataset-wide prior values
+        #  TODO: Need to set values for known workers appropriately
         self.annoStore.addAnnotations(
-            self.dataBatch,  # [~self.dataBatch["empty"]],
+            self.dataBatch,
             self.datasetWidePriorInitialValues,
+            statisticStore=self.statStore,
         )
         self.images = self.annoStore.generateViews(
             "image_id", ImageView, self.statStore
@@ -295,7 +354,8 @@ class BoxAggregator:
             self.datasetWidePriorParameters,
         )
 
-        self.likelihoods = []
+        self.batchLikelihoods.append([])
+        self.likelihoods = self.batchLikelihoods[-1]
 
     def computeConnectionCosts(
         self,
@@ -639,6 +699,7 @@ class BoxAggregator:
         NoneType
 
         """
+        # NOTE: self.groundTruthBoxCoordsFrame
         print("\tMerging overlapping ground truth boxes...")
         # Find indices of gt boxes from images with more than one ground truth
         mergeableGtBoxes = (
@@ -726,6 +787,7 @@ class BoxAggregator:
             )
             .to_numpy()
         )
+
         # Now find all annotations that belong to the mergee
         selector = (
             self.annoStore.annotations.loc[:, ["image_id", "association"]]
@@ -740,6 +802,18 @@ class BoxAggregator:
                 if mtf.index.size == 0:
                     print("Zero-length index", mtf.columns, res, sep="\n")
                 res = mtf.loc[(row.image_id, row.association)]
+                if res.ndim > 1:
+                    res = res.head(1).squeeze()
+                if len(res.shape) != 1:
+                    print(
+                        "Not 1-dimensional",
+                        res.shape,
+                        res,
+                        mtf.loc[(row.image_id, row.association)],
+                        mtf.loc[(row.image_id, row.association)].head(1),
+                        sep="\n\n",
+                    )
+
                 return res  # mtf.loc[(row.image_id, row.association)]
             except KeyError as e:
                 print(e, row.image_id, row.association, mtf, mtf.index, sep="\n")
@@ -751,20 +825,31 @@ class BoxAggregator:
         if not np.any(selector):
             print("No matches!")
         else:
+            mtf = mergeTargetFrame.reset_index(level=0).sort_index()
+            targetAssociations = self.annoStore.annotations.loc[
+                selector, ["image_id", "association"]
+            ].apply(
+                printingExtract,  # lambda row, mtf: mtf.loc[(row.image_id, row.association)],
+                axis=1,
+                args=(mtf,),
+            )
             try:
-                self.annoStore.annotations.loc[selector, "association"] = (
+                self.annoStore.annotations.loc[
+                    selector, "association"
+                ] = targetAssociations.target_association.to_numpy()
+            except AttributeError as e:
+                print(
+                    e,
+                    selector,
+                    np.flatnonzero(selector),
+                    mergeTargetFrame,
+                    targetAssociations,
+                    targetAssociations.iloc[0],
                     self.annoStore.annotations.loc[
                         selector, ["image_id", "association"]
-                    ]
-                    .apply(
-                        printingExtract,  # lambda row, mtf: mtf.loc[(row.image_id, row.association)],
-                        axis=1,
-                        args=(mergeTargetFrame.reset_index(level=0),),
-                    )
-                    .target_association.to_numpy()
+                    ],
+                    sep="\n\n",
                 )
-            except AttributeError as e:
-                print(e, selector, mergeTargetFrame, sep="\n")
 
     def computeWorkerSkills(self, worker, verbose=False):
         # worker annotations
@@ -862,10 +947,10 @@ class BoxAggregator:
         # previous batches.
 
         # The false negative probability (considering all prior information)
-        falseNegProb = worker.getNumFalseNeg() / worker.getNumFalseNegTrials()
+        falseNegProb = worker.getNumFalseNegative() / worker.getNumFalseNegativeTrials()
 
         # The false positive probability (considering all prior information)
-        falsePosProb = worker.getNumFalsePos() / worker.getNumFalsePosTrials()
+        falsePosProb = worker.getNumFalsePositive() / worker.getNumFalsePositiveTrials()
 
         # The variance (considering all prior information)
         # (note that weights are not included in variance computation)
@@ -1035,7 +1120,10 @@ class BoxAggregator:
                         verbose=not init,
                     )
                 else:
-                    print("Empty image:", image.imageId)
+                    print(
+                        f"\t\t\tNo annotations provided for image {image.imageId}"
+                        f" after {image.getNumAnnotations()} views."
+                    )
             except KeyError as e:
                 print(imageIndex, image.imageId, e)
                 raise e
@@ -1063,7 +1151,47 @@ class BoxAggregator:
             self.groundTruthIndexSetSizes,
         )
 
-    def computeBoxImageVariance(self, boxData, image):
+    def computeBoxImageVariance(self, boxData: pd.DataFrame, image: ImageView) -> float:
+        """Computes the expected variance for a ground truth box due to local
+        image difficulty, based on the corresponding subset of annotation data.
+
+        Parameters
+        ----------
+        boxData : pandas.DataFrame
+            Annotation data associated with this ground truth box.
+        image : ImageView
+            The image that the ground truth box pertains to.
+
+        Returns
+        -------
+        float32
+            Expected variance for a ground truth box due to local
+            image difficulty.
+        """
+        priorFactor = image.getVarianceNumerator()
+
+        varWeightComplement = 1 - boxData.variance_weighting
+
+        imageVariance = (
+            priorFactor
+            + (
+                np.nansum(
+                    varWeightComplement
+                    * (
+                        boxData.ground_truth_distance ** 2
+                        + self.statStore.imageStatistics.loc[
+                            image.imageId, "box_variance"
+                        ]
+                    )
+                )
+            )
+        ) / (varWeightComplement.sum() + image.getNumVarianceTrials())
+
+        return imageVariance
+
+    def computeBoxImageVariance_old(
+        self, boxData: pd.DataFrame, image: ImageView
+    ) -> float:
         """Computes the expected variance for a ground truth box due to local
         image difficulty, based on the corresponding subset of annotation data.
 
@@ -1119,7 +1247,7 @@ class BoxAggregator:
             # Image part (image-based variance only)
             associationGroupedMatchingAnnos = matchingAnnos.groupby(by="association")
             groupImageVariances = associationGroupedMatchingAnnos.apply(
-                self.computeBoxImageVariance, image
+                self.computeBoxImageVariance, image  ##HERE
             )
             # Note: Association values refer to a single ground truth within the
             # context of a single image. We are considering annotations for a single
@@ -1176,6 +1304,9 @@ class BoxAggregator:
         # estimate divided by the number of ground truth boxes in the
         # image this ground-truth box belongs.
         imageGroupedAnnotations = self.annoStore.annotations.groupby(by="image_id")
+        # All boxes in an image have a shared component of variance that
+        # decreases as more ground truth boxes are established.
+        # TODO: Don't think this needs adapting for multi-batch mode.
         self.statStore.setImageBoxVariances(
             self.datasetWidePriorInitialValues["image_difficulty"]["variance"]
             / np.maximum(
@@ -1185,7 +1316,9 @@ class BoxAggregator:
         )
         # Step 2: Compute and store worker skill parameters and map to annotations
         self.statStore.setWorkerSkills(
-            np.array([self.computeWorkerSkills(worker) for worker in self.workers])
+            np.array(
+                [self.computeWorkerSkills(worker) for worker in self.workers]
+            )  ##HERE
         )
         self.annoStore.annotations.false_pos_prob = self.statStore.workerStatistics.false_pos_prob.loc[
             self.annoStore.annotations.worker_id
@@ -1202,7 +1335,9 @@ class BoxAggregator:
         for image in self.images:
             self.computeImageAndLabelParameters(image)
 
-    def computeImagePriorLogLikelihood(self, imageGroundTruthData: pd.Series) -> float:
+    def computeImagePriorLogLikelihood_old(
+        self, imageGroundTruthData: pd.Series
+    ) -> float:
         """Compute *prior* negative log likelihood for image difficulty parameter
         models, given the *current* parameter estimates.
 
@@ -1239,6 +1374,34 @@ class BoxAggregator:
                         "nInv_chisq_variance"
                     ]
                 )
+                * np.log(imageGroundTruthData.image_variance)
+            )
+        ).sum() / imageGroundTruthData.shape[0]
+        return imageLogLikelihood
+
+    def computeImagePriorLogLikelihood(self, imageGroundTruthData: pd.Series) -> float:
+        """Compute *prior* negative log likelihood for image difficulty parameter
+        models, given the *current* parameter estimates.
+
+        The likelihood component is computed in computeLabelLogLikelihood.
+
+        Parameters
+        ----------
+        imageGroundTruthData : pd.Series
+            Accumulated and prior statistical information for a single image.
+
+        Returns
+        -------
+        float
+            Combined negative log-likelihood for image difficulty prior model.
+
+        """
+        stats = self.statStore.imageStatistics.loc[imageGroundTruthData.name]
+
+        imageLogLikelihood = (
+            ((-stats.variance_numerator) / (2 * imageGroundTruthData.image_variance))
+            - (
+                (1 + 0.5 * stats.num_variance_trials)
                 * np.log(imageGroundTruthData.image_variance)
             )
         ).sum() / imageGroundTruthData.shape[0]
@@ -1319,48 +1482,31 @@ class BoxAggregator:
 
         """
         # false positive -log(prior)
-        fp = (
-            self.datasetWidePriorParameters["volunteer_skill"]["nBeta_false_pos"]
-            * workerData.false_pos_prob_prior
-            - 1
-        ) * np.log(workerData.false_pos_prob) + (
-            (1 - workerData.false_pos_prob_prior)
-            * self.datasetWidePriorParameters["volunteer_skill"]["nBeta_false_pos"]
-            - 1
-        ) * np.log(
-            1 - workerData.false_pos_prob
-        )
+        # Note: interpret the complement as "condition not false positive" and
+        # not "condition true positive".
+        fp = (workerData.num_false_pos - 1) * np.log(workerData.false_pos_prob) + (
+            workerData.num_not_false_pos - 1
+        ) * np.log(1 - workerData.false_pos_prob)
 
         # false negative -log(prior)
-        fn = (
-            self.datasetWidePriorParameters["volunteer_skill"]["nBeta_false_neg"]
-            * workerData.false_neg_prob_prior
-            - 1
-        ) * np.log(workerData.false_neg_prob) + (
-            (1 - workerData.false_neg_prob_prior)
-            * self.datasetWidePriorParameters["volunteer_skill"]["nBeta_false_neg"]
-            - 1
-        ) * np.log(
-            1 - workerData.false_neg_prob
-        )
+        # Note: interpret the complement as "condition not false negative" and
+        # not "condition true negative".
+        fn = (workerData.num_false_neg - 1) * np.log(workerData.false_neg_prob) + (
+            workerData.num_not_false_neg - 1
+        ) * np.log(1 - workerData.false_neg_prob)
 
         # variance log(prior) - not negative.
-        var = (
-            self.datasetWidePriorParameters["volunteer_skill"]["nInv_chisq_variance"]
-            * workerData.variance_prior
-            / (2 * workerData.variance)
-        ) + (
-            1
-            + self.datasetWidePriorParameters["volunteer_skill"]["nInv_chisq_variance"]
-            / 2
-        ) * np.log(
-            workerData.variance
-        )
+        var = (workerData.variance_numerator / (2 * workerData.variance)) + (
+            1 + workerData.num_variance_trials / 2
+        ) * np.log(workerData.variance)
+
         return fp + fn - var
 
     def computeLabelLogLikelihood(self, imageAnnoData):
+        # Contributions for annotations that match a ground truth i.e. true
+        # positives
         matchingAnnos = imageAnnoData.loc[imageAnnoData.matches_ground_truth]
-
+        # n_tp*log(gaussian(D, sigma**2) + n_tp*log(1-p_fp))
         truePosLL = (
             -0.5
             * matchingAnnos.ground_truth_distance ** 2
@@ -1370,19 +1516,23 @@ class BoxAggregator:
             + np.log(1 - matchingAnnos.false_pos_prob)
         ).sum()
 
+        # Contributions from annotations that do not match a ground truth i.e.
+        # false positives
         nonMatchingAnnos = imageAnnoData.loc[~imageAnnoData.matches_ground_truth]
-        ## NOTE: Document this!
+        ## TODO: Document this! Method of estimating number of true negatives?
+        # n_fp*log(p_fp) - n_fp*log(max_num)
         falsePosLL = (
             np.log(nonMatchingAnnos.false_pos_prob)
             - np.log(self.datasetWidePriorParameters["shared"]["max_num_ground_truths"])
         ).sum()
 
-        # Question: What if a worker sees an image, but annotates nothing? Should affect FN.
+        # Contributions from the incidents when a worker fails to annotate a
+        # ground truth i.e. false negatives
         workerGroupFalseNegProbs = matchingAnnos.groupby(by="worker_id").false_neg_prob
 
-        # Did a worker supply a box that matched a ground truth
         numPossibleMatches = matchingAnnos.association.nunique()
         numWorkerMatches = workerGroupFalseNegProbs.count()
+        # n_tp*log(1-p_fn) + n_fn*log(p_fn)
         falseNegLL = (
             np.log(1 - workerGroupFalseNegProbs.head()) * numWorkerMatches
             + np.log(workerGroupFalseNegProbs.head())
@@ -1407,7 +1557,7 @@ class BoxAggregator:
         )
 
         self.imagePriorLogLikelihoods = imageGroupedGroundTruths.apply(
-            self.computeImagePriorLogLikelihood
+            self.computeImagePriorLogLikelihood  ##HERE
         )
 
         emptyImages = self.annoStore.annotations.loc[
@@ -1431,8 +1581,31 @@ class BoxAggregator:
         )
 
         # Step 2: Compute worker negative log-likelihood prior components.
-        self.workerPriorLogLikelihoods = self.statStore.workerStatistics.apply(
-            self.computeWorkerPriorLogLikelihood, axis=1
+        # Note that we use the cached statistics from initialisation or the
+        # previous batch for the prior counts, but the current values for the
+        # likelihood parameters.
+        priorCountStatColumns = [
+            "num_false_pos",
+            "num_not_false_pos",
+            "num_false_neg",
+            "num_not_false_neg",
+            "variance_numerator",
+            "num_variance_trials",
+        ]
+        parameterStatColumns = ["variance", "false_pos_prob", "false_neg_prob"]
+        workerStats = pd.concat(
+            [
+                self.statStore.getWorkerStatistics(cached=True).loc[
+                    :, priorCountStatColumns
+                ],
+                self.statStore.getWorkerStatistics(cached=False).loc[
+                    :, parameterStatColumns
+                ],
+            ],
+            axis=1,
+        )
+        self.workerPriorLogLikelihoods = workerStats.apply(
+            self.computeWorkerPriorLogLikelihood, axis=1  ##HERE
         )
 
         # Step 3: Compute label negative log-likelihoods.
@@ -1475,12 +1648,29 @@ class BoxAggregator:
         print("\tComputing Likelihood Model...")
         return self.computeBatchLikelihood()
 
-    def processBatchEnd(self):
-        # Copy worker probs to prior probs
-        # Update worker prior params using the count of clicks they
-        # actually provided
-        # Copy image probs to prior probs
-        pass
+    def finaliseBatch(self):
+        print("Finalising batch")
+        # Find finished images.
+        finishedImages = self.imageCompletionAssessor(
+            self.statStore.imageStatistics, self.imageCompletionParams
+        )
+        print(f"Found {finishedImages.sum()} finshed images.")
+        finishedImagesIndex = finishedImages.loc[finishedImages].index
+        # Remove all annotations for finished images
+        # Note that ImageViews and WorkerViews will be regenerated when new
+        # batch initialises.
+        self.annoStore.annotations = self.annoStore.annotations.loc[
+            ~self.annoStore.annotations.image_id.isin(finishedImagesIndex).to_numpy()
+        ]
+        # Explicitly clear statistic store caches
+        self.statStore.clearCache()
+        # Update image statistic store to register that images are finished.
+        # This will allow future classifications for these images to be
+        # discarded in offline mode if desired.
+        # Since worker statistics are not reset at the end of a batch, their
+        # skill statistics will reflect images that are removed from the
+        # pool.
+        self.statStore.imageStatistics.loc[finishedImagesIndex, "finished"] = True
 
     def computeImageExpNumFalseNegative(self, imageAnnotations, grouper):
         # Can only compute false negative probability using data for this image
@@ -1875,7 +2065,9 @@ class BoxAggregator:
         # Step 6g: Save per image risks
         self.statStore.setImageRisk(imageRisks, imageRisks.index)
 
-    def processBatch(self, stopEarlyAfterStep=None):
+    def processBatch(self, dataBatch, stopEarlyAfterStep=None):
+        self.setupNewBatch(dataBatch)
+
         # ** Once-per-batch computations
         # Step 1: Compute 1-IOU distances between all annotations in normalised coordinates
         print("Computing IoU distances...")
@@ -1946,6 +2138,8 @@ class BoxAggregator:
         # Step 4:
         # ** Initial batch processing
         print("Initial batch processing...")
+        self.statStore.cacheWorkers()
+        self.statStore.cacheImages()
         self.processBatchStep(init=True)
         if self.computeStepwiseRisks:
             self.computeRisks()
@@ -1956,6 +2150,9 @@ class BoxAggregator:
             print(f"Stopping early after init.")
             return
 
+        self.statStore.restoreCachedWorkers()
+        self.statStore.restoreCachedImages()
+
         # Step 5:
         # ** Expectation maximisation
         currentLikelihood = -np.inf
@@ -1964,7 +2161,11 @@ class BoxAggregator:
             print(f"Batch processing iteration {batchStep}...")
             self.statStore.resetAssociatedBoxes()
             self.statStore.resetGroundTruths()
+            self.statStore.cacheWorkers()
+            self.statStore.cacheImages()
             currentLikelihood = self.processBatchStep(init=False)
+            # Store record of likelihood value for this iteration
+            self.likelihoods.append(currentLikelihood)
             if self.computeStepwiseRisks:
                 self.computeRisks()
             if self.savePath is not None:
@@ -1983,11 +2184,16 @@ class BoxAggregator:
                     f"Not Converged @ {currentLikelihood} (Previous: {previousLikelihood})"
                 )
                 previousLikelihood = currentLikelihood
-                # Store record of likelihood value for this iteration
-                self.likelihoods.append(currentLikelihood)
+
+                # Restore cached worker/image statistics
+                self.statStore.restoreCachedWorkers()
+                self.statStore.restoreCachedImages()
 
         if not self.computeStepwiseRisks:
             self.computeRisks()
+
+        # Determine finished images, cleanup and persistence operations.
+        self.finaliseBatch()
 
         if self.savePath is not None:
             finalSavePath = os.path.join(self.savePath, f"final.pkl")

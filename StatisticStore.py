@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from typing import Sequence
 
 from SaveableStore import SaveableStore
 
@@ -16,8 +17,48 @@ class StatisticStore(SaveableStore):
     def __init__(self):
         self.workerStatistics = pd.DataFrame()
         self.imageStatistics = pd.DataFrame()
+
+        # Remaining DatatFrames require more complicated instantiation
         self.resetGroundTruths()
         self.resetAssociatedBoxes()
+
+        # A cache to preserve state between expectation maximisation iterations
+        self.cache = dict()
+
+    def cacheWorkers(self):
+        self.cache.update(dict(workerStatistics=self.workerStatistics.copy(deep=True)))
+
+    def cacheImages(self):
+        self.cache.update(dict(imageStatistics=self.imageStatistics.copy(deep=True)))
+
+    def restoreCachedWorkers(self):
+        self.workerStatistics = self.cache.pop("workerStatistics")
+
+    def restoreCachedImages(self):
+        self.imageStatistics = self.cache.pop("imageStatistics")
+
+    def getCachedWorkers(self):
+        return self.cache.get("workerStatistics", None)
+
+    def getCachedImages(self):
+        return self.cache.get("imageStatistics", None)
+
+    def clearCache(self, keys: Sequence = None):
+        if keys is None:
+            self.cache.clear()
+        else:
+            for key in keys:
+                del self.cache[key]
+
+    def getWorkerStatistics(self, cached=False):
+        if cached:
+            return self.cache["workerStatistics"]
+        return self.workerStatistics
+
+    def getImageStatistics(self, cached=False):
+        if cached:
+            return self.cache["imageStatistics"]
+        return self.imageStatistics
 
     def addWorkers(self, annotationStore, priors, priorParams):
         newWorkerIds = pd.Index(
@@ -29,6 +70,7 @@ class StatisticStore(SaveableStore):
                 self.workerStatistics,
                 pd.DataFrame(
                     dict(
+                        # Static initial values
                         worker_id=newWorkerIds,
                         false_pos_prob_prior=priors["volunteer_skill"][
                             "false_pos_prob"
@@ -37,6 +79,7 @@ class StatisticStore(SaveableStore):
                             "false_neg_prob"
                         ],
                         variance_prior=priors["volunteer_skill"]["variance"],
+                        # Dynamic values updated on every iteration within a batch
                         false_pos_prob=priors["volunteer_skill"]["false_pos_prob"],
                         false_neg_prob=priors["volunteer_skill"]["false_neg_prob"],
                         variance=priors["volunteer_skill"]["variance"],
@@ -44,13 +87,21 @@ class StatisticStore(SaveableStore):
                         num_false_pos_trials=priorParams["volunteer_skill"][
                             "nBeta_false_pos"
                         ],
-                        num_false_pos=priorParams["volunteer_skill"]["nBeta_false_neg"]
+                        num_false_pos=priorParams["volunteer_skill"]["nBeta_false_pos"]
                         * priors["volunteer_skill"]["false_pos_prob"],
+                        num_not_false_pos=priorParams["volunteer_skill"][
+                            "nBeta_false_pos"
+                        ]
+                        * (1 - priors["volunteer_skill"]["false_pos_prob"]),
                         num_false_neg_trials=priorParams["volunteer_skill"][
                             "nBeta_false_neg"
                         ],
                         num_false_neg=priorParams["volunteer_skill"]["nBeta_false_neg"]
                         * priors["volunteer_skill"]["false_neg_prob"],
+                        num_not_false_neg=priorParams["volunteer_skill"][
+                            "nBeta_false_neg"
+                        ]
+                        * (1 - priors["volunteer_skill"]["false_neg_prob"]),
                         num_variance_trials=priorParams["volunteer_skill"][
                             "nInv_chisq_variance"
                         ],
@@ -86,7 +137,14 @@ class StatisticStore(SaveableStore):
                         expected_num_inaccurate=0,
                         risk=np.infty,
                         open_cost=0,
-                        num_annotations_provided=0,
+                        num_variance_trials=priorParams["image_difficulty"][
+                            "nInv_chisq_variance"
+                        ],
+                        variance_numerator=priorParams["image_difficulty"][
+                            "nInv_chisq_variance"
+                        ]
+                        * priors["image_difficulty"]["variance"],
+                        is_finished=False,
                     )
                 ).set_index("image_id"),
             ]
