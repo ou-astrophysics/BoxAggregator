@@ -9,6 +9,9 @@ import pickle
 import os
 import collections
 
+import logging
+import sys
+
 from FacilityLocation import FacilityLocation, FData, CData
 from AnnotationStore import AnnotationStore
 from StatisticStore import StatisticStore
@@ -58,6 +61,7 @@ def computeDisallowedConnectionMask(
         end = begin + exclusiveIndexSetSize
         for left in exclusiveIndices[begin:end]:
             for right in exclusiveIndices[begin:end]:
+                # Value of zero implies that the connection is diallowed
                 mask[left + 1, right + 1] = 0
         begin = end
 
@@ -179,8 +183,8 @@ class BoxAggregator:
     )
 
     # Note required_overlap_fraction is a bit of a misnomer. In fact it is
-    # interpreted as a 1-IoU distance, so it is really more like the reciprocal
-    # of the required overlap fraction.
+    # interpreted as the maximum allowable 1-IoU distance, so it is really more
+    # like the reciprocal of the required overlap fraction.
     defaultInitPhaseParams = dict(
         required_multiplicity_fraction=0.1, required_overlap_fraction=0.6
     )
@@ -192,6 +196,7 @@ class BoxAggregator:
         max_expected_num_false_pos=0.3,
         max_expected_num_false_neg=0.3,
         max_expected_num_inaccurate=0.3,
+        max_num_batches_not_finished=10,
     )
 
     defaultLossParams = dict(
@@ -225,7 +230,10 @@ class BoxAggregator:
         datasetWidePriorParameters=None,
         savePath=None,
         computeStepwiseRisks=False,
+        maxBatchIterations=10,
+        logFile=None,
     ):
+        self.setupLogging(logFile)
 
         self.datasetWidePriorInitialValues = (
             BoxAggregator.defaultDatasetWidePriorInitialValues
@@ -271,9 +279,14 @@ class BoxAggregator:
         self.savePath = savePath
         # Computationally expensive, but can be useful for diagnostics
         self.computeStepwiseRisks = computeStepwiseRisks
+        self.maxBatchIterations = maxBatchIterations
 
         # Class that implements image-specific computations
         self.imageProcessor = ImageProcessor()
+
+        # Save settings for this run.
+        if self.savePath is not None:
+            self.saveSettings(os.path.join(self.savePath, f"settings.pkl"))
 
         self.setup()
 
@@ -281,8 +294,10 @@ class BoxAggregator:
         return (
             dataBatch.groupby(by=["worker_id"])
             .filter(
-                lambda x: x.image_id.unique().size
-                > filterParams["min_images_per_worker"]
+                lambda x: (
+                    x.image_id.unique().size > filterParams["min_images_per_worker"]
+                )
+                and workerFilter(x.name)
             )
             .groupby(by=["image_id"])
             .filter(
@@ -322,11 +337,28 @@ class BoxAggregator:
         return result
 
     def setup(self):
-        self.annoStore = AnnotationStore()
-        self.statStore = StatisticStore()
+        self.annoStore = AnnotationStore(logFunction=self.printToLog)
+        self.statStore = StatisticStore(logFunction=self.printToLog)
         self.batchLikelihoods = []
+        self.batchCounter = 0
+        self.finishedImageRunningTotal = 0
+
+    def setupLogging(self, logFile=None):
+        self.logger = logging.getLogger("BoxAggregatorLogger")
+        self.logger.setLevel(logging.INFO)
+
+        if logFile is not None:
+            self.logger.handlers = []
+            self.logger.propagate = False
+            logHandler = logging.FileHandler(logFile)
+            logHandler.setLevel(logging.INFO)
+            self.logger.addHandler(logHandler)
+
+    def printToLog(self, *args, logtype="info", sep=" "):
+        getattr(self.logger, logtype)(sep.join(str(a) for a in args))
 
     def setupNewBatch(self, dataBatch):
+        self.batchCounter += 1
         self.dataBatch = (
             self.inputDataFilter(dataBatch, self.filterParams)
             if self.inputDataFilter is not None
@@ -334,8 +366,8 @@ class BoxAggregator:
             if self.applyInputDataFilter
             else dataBatch
         )
+
         # Add new annotations and initialise with dataset-wide prior values
-        #  TODO: Need to set values for known workers appropriately
         self.annoStore.addAnnotations(
             self.dataBatch,
             self.datasetWidePriorInitialValues,
@@ -382,11 +414,18 @@ class BoxAggregator:
     ):
         # indices are needed to index np arrays
         annotationIndices = image.getAnnotationIndices()
-        # labels are needed tio index pandas dataframes using .loc[]
+        # labels are needed to index pandas dataframes using .loc[]
         annotationIndexLabels = image.getAnnotationIndexLabels()
+        # Filter empty annotations
+        validAnnoSelector = ~image.getAnnotations()["empty"]
+        annotationIndices = annotationIndices[validAnnoSelector]
+        annotationIndexLabels = annotationIndexLabels[validAnnoSelector]
+
         # Select the dummy (0) and all annotations associated with this image
         # Note the +1 offset accounts for the dummy in the zeroth row/column.
         selectedAnnotationIndices = [0] + (annotationIndices + 1).tolist()
+        selectedAnnotationIndexLabels = [-1] + (annotationIndexLabels).tolist()
+
         # ix_ builds an indexer array to extract a 2D subset of connection costs
         selector = np.ix_(selectedAnnotationIndices, selectedAnnotationIndices)
         fl = FacilityLocation(
@@ -399,11 +438,11 @@ class BoxAggregator:
 
         image.annotationStore.annotations.loc[
             annotationIndexLabels, "is_ground_truth"
-        ] = fl.fData.data[1:, FData.isOpen].astype(bool)
+        ] = fl.fData.data[1:, FData.isOpen].astype(bool, copy=False)
 
         image.annotationStore.annotations.loc[
             annotationIndexLabels, "is_cleanup_ground_truth"
-        ] = fl.fData.data[1:, FData.isCleanup].astype(bool)
+        ] = fl.fData.data[1:, FData.isCleanup].astype(bool, copy=False)
 
         image.annotationStore.annotations.loc[annotationIndexLabels, "association"] = (
             fl.cData.data[1:, CData.facility] - 1
@@ -413,14 +452,14 @@ class BoxAggregator:
         # index using the open facilities connected to and all cities
         connectedCosts = connectionCosts[selector][  # includes dummy
             fl.cData.data[1:, CData.facility].astype(
-                int
+                int, copy=False
             ),  # selects rows for facilities
             range(1, fl.cData.data.shape[0]),  # selects all but dummy city
         ]
 
         # if verbose:
         #     if image.imageId == 36718317:
-        #         print(
+        #         self.printToLog(
         #             "C => P > 1",
         #             image.imageId,
         #             annotationIndexLabels,
@@ -428,7 +467,7 @@ class BoxAggregator:
         #             # np.exp(-connectedCosts),
         #             sep="\n",
         #         )
-        #         print(
+        #         self.printToLog(
         #             connectionCosts[selector],
         #             *zip(
         #                 fl.cData.data[1:, CData.facility].astype(int),
@@ -439,7 +478,7 @@ class BoxAggregator:
         #             sep="\n",
         #         )
         #
-        #         print(
+        #         self.printToLog(
         #             "Before",
         #             *zip(
         #                 fl.cData.data[1:, CData.facility].astype(int),
@@ -454,7 +493,7 @@ class BoxAggregator:
         image.annotationStore.annotations.loc[
             annotationIndexLabels, "connection_cost"
         ] = connectedCosts
-        # print(
+        # self.printToLog(
         #     "After",
         #     *zip(
         #         fl.cData.data[1:, CData.facility].astype(int),
@@ -568,7 +607,7 @@ class BoxAggregator:
         NoneType
 
         """
-        print("\tPruning/merging isolated boxes...")
+        self.printToLog("\tPruning/merging isolated boxes...")
         self.annoStore.resetPruningLabels()
         # Select valid annotations that are not associated with the dummy
         validAnnos = self.annoStore.annotations[
@@ -583,101 +622,138 @@ class BoxAggregator:
             .filter(lambda grp: grp.index.size <= 1)
             .index
         )
-        print(f"\t\tFound {isolated.size} isolated boxes")
+        self.printToLog(f"\t\tFound {isolated.size} isolated boxes")
 
         if isolated.size > 0 and attemptMerge:
-            print("\t\tAttempting to merge isolated boxes to ground truths...")
+            self.printToLog(
+                "\t\tAttempting to merge isolated boxes to ground truths..."
+            )
             # Find ground truth boxes to match against
             associated = validAnnos.groupby(["image_id", "association"]).filter(
                 lambda grp: grp.index.size > 1
             )
             associated = associated[associated.is_ground_truth].index
-            # Only try to merge isolated boxes in images that have at least
-            # one ground truth box
+            # Determine whether any isolated boxes are in an image that has
+            # at least one ground truth box.
             matchable = self.annoStore.annotations.loc[isolated].image_id.isin(
                 self.annoStore.annotations.loc[associated].image_id
             )
 
+            # If any match candidates were provided by the same worker as the
+            # isolated box, remove them.
+
+            # Get the distance between the isolated boxes and their potential
+            # associations.
+            distances = self.distances.loc[
+                matchable[matchable].index.to_list(), associated.to_list()
+            ]
+
+            # Retrieve the appropriate segment of the disallowed connection mask
+            # Connection mask value of zero implies disallowed connection
+            mask = (
+                self.disallowedConnectionMask.loc[
+                    associated.to_list(), matchable[matchable].index.to_list()
+                ]
+                < 1
+            )
+            # Prevent matching any boxes provided by the same worker for the same
+            # image by setting the corresponding distance to infinity.
+            self.printToLog(
+                f"\t\t\tDisallowing {mask.sum().sum()} merge candidates provided by the same worker for the same image"
+            )
+            # Mask replaces anywhere disallowed >= 1
+            distances = distances.mask(mask, np.infty)
+
             # Compute the index of an associated box that minimizes the distance to
             # an isolated ground truth within each image
-            closest = (
-                self.distances.loc[
-                    matchable[matchable].index.to_list(), associated.to_list()
-                ]
-                .groupby(
-                    by=self.annoStore.annotations.loc[
-                        matchable[matchable].index.to_list()
-                    ].image_id
+            rawClosest = distances.groupby(
+                by=self.annoStore.annotations.loc[
+                    matchable[matchable].index.to_list()
+                ].image_id
+            ).apply(
+                lambda grp: grp.T.groupby(
+                    self.annoStore.annotations.loc[associated.to_list()].image_id
                 )
-                .apply(
-                    lambda grp: grp.T.groupby(
-                        self.annoStore.annotations.loc[associated.to_list()].image_id
-                    )
-                    .get_group(grp.name)
-                    .idxmin(axis=0)
-                )
+                .get_group(grp.name)
+                .idxmin(axis=0)
             )
-            # print(closest.reset_index(level=1).to_numpy().T + 1)
-            matchCandidates = (
-                pd.concat(
-                    [
-                        closest,
-                        pd.Series(
-                            self.distances.lookup(
-                                *(closest.reset_index(level=1).to_numpy().T)
+            try:
+                closest = rawClosest.loc[np.isfinite(rawClosest)]
+            except ValueError as e:
+                print(e, rawClosest, sep="\n")
+            if closest.shape[0] > 0:
+                matchCandidates = (
+                    pd.concat(
+                        [
+                            closest,
+                            pd.Series(
+                                self.distances.lookup(
+                                    *(closest.reset_index(level=1).to_numpy().T)
+                                ),
+                                index=closest.index,
                             ),
-                            index=closest.index,
-                        ),
-                    ],
-                    axis=1,
+                        ],
+                        axis=1,
+                    )
+                    .reset_index(level=1)
+                    .rename(
+                        columns={0: "closest", 1: "distance", "level_1": "isolated"}
+                    )
                 )
-                .reset_index(level=1)
-                .rename(columns={0: "closest", 1: "distance", "level_1": "isolated"})
-            )
-            # Identify isolated boxes that are close enough to associations to merge
-            matchCandidates["overlaps"] = matchCandidates.distance < mergeThreshold
 
-            # Correct associations appropriately
-            self.annoStore.annotations.loc[
-                matchCandidates.isolated.to_list(), "is_pruned"
-            ] = True
-            self.annoStore.annotations.loc[
-                matchCandidates.isolated.to_list(), "prune_distance"
-            ] = matchCandidates.distance.to_numpy()
-            self.annoStore.annotations.loc[
-                matchCandidates[matchCandidates.overlaps].isolated.to_list(),
-                "is_merged",
-            ] = True
-            self.annoStore.annotations.loc[
-                matchCandidates[matchCandidates.overlaps].isolated.to_list(),
-                "association",
-            ] = self.annoStore.annotations.loc[
-                matchCandidates[matchCandidates.overlaps].closest.to_list(),
-                "association",
-            ].to_numpy()
-            self.annoStore.annotations.loc[
-                matchCandidates[matchCandidates.overlaps].isolated.to_list(),
-                "is_ground_truth",
-            ] = False
-            self.annoStore.annotations.loc[
-                matchCandidates[matchCandidates.overlaps].isolated.to_list(),
-                "matches_ground_truth",
-            ] = True
+                # Identify isolated boxes that are close enough to associations to merge
+                matchCandidates["overlaps"] = matchCandidates.distance < mergeThreshold
+                if matchCandidates.overlaps.any():
+                    self.printToLog(
+                        f"\t\t{matchCandidates.overlaps.sum()} Viable merge candidates found."
+                    )
+                else:
+                    self.printToLog(f"\t\tNo viable merge candidates found.")
 
-            self.annoStore.annotations.loc[
-                matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
-                "association",
-            ] = -1
-            self.annoStore.annotations.loc[
-                matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
-                "is_ground_truth",
-            ] = False
-            self.annoStore.annotations.loc[
-                matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
-                "matches_ground_truth",
-            ] = False
-        elif isolated.size > 0:
-            print("\t\tAssigning isolated boxes to the dummy...")
+                # Correct associations appropriately
+                self.annoStore.annotations.loc[
+                    matchCandidates.isolated.to_list(), "is_pruned"
+                ] = True
+                self.annoStore.annotations.loc[
+                    matchCandidates.isolated.to_list(), "prune_distance"
+                ] = matchCandidates.distance.to_numpy()
+                self.annoStore.annotations.loc[
+                    matchCandidates[matchCandidates.overlaps].isolated.to_list(),
+                    "is_merged",
+                ] = True
+                self.annoStore.annotations.loc[
+                    matchCandidates[matchCandidates.overlaps].isolated.to_list(),
+                    "association",
+                ] = self.annoStore.annotations.loc[
+                    matchCandidates[matchCandidates.overlaps].closest.to_list(),
+                    "association",
+                ].to_numpy()
+                self.annoStore.annotations.loc[
+                    matchCandidates[matchCandidates.overlaps].isolated.to_list(),
+                    "is_ground_truth",
+                ] = False
+                self.annoStore.annotations.loc[
+                    matchCandidates[matchCandidates.overlaps].isolated.to_list(),
+                    "matches_ground_truth",
+                ] = True
+
+                self.annoStore.annotations.loc[
+                    matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
+                    "association",
+                ] = -1
+                self.annoStore.annotations.loc[
+                    matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
+                    "is_ground_truth",
+                ] = False
+                self.annoStore.annotations.loc[
+                    matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
+                    "matches_ground_truth",
+                ] = False
+                return
+            else:
+                self.printToLog(f"\t\tNo viable merge candidates found.")
+        if isolated.size > 0:
+            self.printToLog("\t\tAssigning isolated boxes to the dummy...")
             self.annoStore.annotations.loc[isolated, "is_pruned"] = True
             self.annoStore.annotations.loc[isolated, "association"] = -1
             self.annoStore.annotations.loc[isolated, "is_ground_truth"] = False
@@ -691,7 +767,7 @@ class BoxAggregator:
         Parameters
         ----------
         mergeThreshold : float
-            The maximum IoU distance between two ground truths that may be
+            The maximum 1-IoU distance between two ground truths that may be
             combined.
 
         Returns
@@ -699,8 +775,7 @@ class BoxAggregator:
         NoneType
 
         """
-        # NOTE: self.groundTruthBoxCoordsFrame
-        print("\tMerging overlapping ground truth boxes...")
+        self.printToLog("\tMerging overlapping ground truth boxes...")
         # Find indices of gt boxes from images with more than one ground truth
         mergeableGtBoxes = (
             self.annoStore.annotations[self.annoStore.annotations.is_ground_truth]
@@ -711,236 +786,359 @@ class BoxAggregator:
         gtBoxDistances = self.distances.loc[
             mergeableGtBoxes.index, mergeableGtBoxes.index
         ]
-        # For each image find any pairs of gtBoxes that overlap by more than 70%
-        mergeLists = gtBoxDistances.groupby(by=mergeableGtBoxes.image_id).apply(
-            lambda grp: grp.T.groupby(by=mergeableGtBoxes.image_id)
-            .get_group(grp.name)
-            .lt(mergeThreshold)
-            .apply(lambda s: s.index[np.argwhere(s.to_numpy()).T[0]].to_numpy(), axis=1)
+
+        # As in the prune stage, mask any disallowed connections
+        # Retrieve the appropriate segment of the disallowed connection mask
+        # Connection mask value of zero implies disallowed connection
+        mask = (
+            self.disallowedConnectionMask.loc[
+                mergeableGtBoxes.index, mergeableGtBoxes.index
+            ]
+            < 0.5
+        )
+        # Prevent matching any boxes provided by the same worker for the same
+        # image by setting the corresponding distance to infinity.
+        self.printToLog(
+            f"\t\tDisallowing {mask.sum().sum()} ground truth merge "
+            "candidates provided by the same worker for the same image"
+        )
+        # Mask replaces anywhere disallowed >= 1
+        gtBoxDistances = gtBoxDistances.mask(mask, np.infty)
+
+        # For each image find any pairs of gtBoxes that are closer than mergeThreshold
+        # Find lists of potential merge candidates for each GT within each specific image
+        gtBoxDistances.index.name = "box_id"
+        mergeLists = (
+            gtBoxDistances.groupby(by=mergeableGtBoxes.image_id)
+            .apply(
+                # Outer group has all box ids as columns and box labels for specific
+                # image as rows. Transpose it and group the boxes again
+                lambda grp: grp.T.groupby(by=mergeableGtBoxes.image_id)
+                .get_group(grp.name)  # get the group that matches the *outer* image_id
+                .lt(mergeThreshold)  # mark boxes that are close enough to merge
+                # extract the ids of boxes that are close enough to merge
+                .apply(lambda s: s.index[np.flatnonzero(s)].to_numpy(), axis=1)
+            )
+            .rename("merge_list")
         )
 
-        # remove bidirectional merges. The order is not important because the final GT box
-        # Is the mean of *all* boxes in the association.
-        filteredMergeLists = pd.Series(
-            mergeLists.reset_index()
-            .apply(
-                lambda mergeList: mergeList.loc[0][
-                    mergeList.loc[0] < mergeList.level_1
+        if not mergeLists.empty:
+            # remove bidirectional merges. The order is not important because
+            # the final GT box is the mean of *all* boxes in the association.
+            try:
+                filteredMergeLists = pd.Series(
+                    # bring the box labels into the space of addressable data as "box_id"
+                    mergeLists.reset_index()
+                    .apply(
+                        # The column name
+                        lambda mergeList: mergeList.merge_list[
+                            mergeList.merge_list < mergeList.box_id
+                        ],
+                        axis=1,
+                    )
+                    .to_numpy(),
+                    index=mergeLists.index,
+                ).rename("filtered_merge_list")
+            except Exception as e:
+                self.printToLog( "Exception filtering ground truth merge lists...", e,
+                    mergeLists.reset_index()
+                    .apply(
+                        # The column name
+                        lambda mergeList: mergeList.merge_list[
+                            mergeList.merge_list < mergeList.box_id
+                        ],
+                        axis=1,
+                    )
+                    .to_numpy(), mergeLists,
+                    logtype="warning", sep="\n"
+                )
+
+            # Collect all information required for merge
+            finalMergeLists = pd.concat(
+                [
+                    filteredMergeLists,
+                    (filteredMergeLists.apply(len) <= 0).rename("merge_list_empty"),
+                    filteredMergeLists.apply(
+                        lambda mergees: self.annoStore.annotations.loc[
+                            mergees, "association"
+                        ].to_numpy()
+                    ).rename("mergee_association"),
+                    pd.Series(
+                        self.annoStore.annotations.loc[
+                            filteredMergeLists.index.get_level_values(1), "association"
+                        ].to_numpy(),
+                        index=filteredMergeLists.index,
+                    ).rename("target_association"),
                 ],
                 axis=1,
             )
-            .to_numpy(),
-            index=mergeLists.index,
-        ).rename("filtered_merge_list")
 
-        # Collect all information required for merge
-        finalMergeLists = pd.concat(
-            [
-                filteredMergeLists,
-                (filteredMergeLists.apply(len) <= 0).rename("merge_list_empty"),
-                filteredMergeLists.apply(
-                    lambda mergees: self.annoStore.annotations.loc[
-                        mergees, "association"
-                    ].to_numpy()
-                ).rename("mergee_association"),
-                pd.Series(
-                    self.annoStore.annotations.loc[
-                        filteredMergeLists.index.get_level_values(1), "association"
-                    ].to_numpy(),
-                    index=filteredMergeLists.index,
-                ).rename("target_association"),
-            ],
-            axis=1,
-        )
+            # If there are no merge candidates, stop here
+            if np.all(finalMergeLists.merge_list_empty):
+                return
+            elif "mergee_association" not in finalMergeLists.columns:
+                self.printToLog("\t\tmergeGroundTruths: No mergee_association")
+                return
+            elif "target_association" not in finalMergeLists.columns:
+                self.printToLog("\t\tmergeGroundTruths: No target_association")
+                return
 
-        # If there are no merge candidates, stop here
-        if np.all(finalMergeLists.merge_list_empty):
-            return
-        elif "mergee_association" not in finalMergeLists.columns:
-            print("\t\tmergeGroundTruths: No mergee_association")
-            return
-        elif "target_association" not in finalMergeLists.columns:
-            print("\t\tmergeGroundTruths: No target_association")
-            return
-
-        # Construct a dataframe with an index enumerating the boxes to be merged and a
-        # column containing the box they should be merged into
-        mergeTargetFrame = pd.concat(
-            finalMergeLists[~finalMergeLists.merge_list_empty]
-            .reset_index()
-            .apply(
-                lambda row: pd.DataFrame(
-                    {
-                        "target": row.level_1,
-                        "target_association": row.target_association,
-                    },
-                    index=[
-                        pd.Series(row.filtered_merge_list, name="mergee"),
-                        pd.Series(
-                            [row.image_id] * row.filtered_merge_list.size,
-                            name="image_id",
-                        ),
-                        pd.Series(row.mergee_association, name="mergee_association"),
-                    ],
-                ),
-                axis=1,
+            # Construct a dataframe with an index enumerating the boxes to be
+            # merged and a column containing the box they should be merged into
+            mergeTargetFrame = pd.concat(
+                finalMergeLists[~finalMergeLists.merge_list_empty]
+                .reset_index()
+                .apply(
+                    lambda row: pd.DataFrame(
+                        {
+                            "target": row.box_id,
+                            "target_association": row.target_association,
+                        },
+                        index=[
+                            pd.Series(row.filtered_merge_list, name="mergee"),
+                            pd.Series(
+                                [row.image_id] * row.filtered_merge_list.size,
+                                name="image_id",
+                            ),
+                            pd.Series(
+                                row.mergee_association, name="mergee_association"
+                            ),
+                        ],
+                    ),
+                    axis=1,
+                )
+                .to_numpy()
             )
-            .to_numpy()
-        )
 
-        # Now find all annotations that belong to the mergee
-        selector = (
-            self.annoStore.annotations.loc[:, ["image_id", "association"]]
-            .apply(tuple, axis=1)
-            .isin(mergeTargetFrame.index.droplevel(0))
-            .to_numpy()
-        )
+            # Now find all annotations that belong to the mergee
+            selector = (
+                self.annoStore.annotations.loc[:, ["image_id", "association"]]
+                .apply(tuple, axis=1)
+                .isin(mergeTargetFrame.index.droplevel(0))
+                .to_numpy()
+            )
 
-        # TODO: All this checking can probably be removed now.
-        def printingExtract(row, mtf):
-            try:
-                if mtf.index.size == 0:
-                    print("Zero-length index", mtf.columns, res, sep="\n")
-                res = mtf.loc[(row.image_id, row.association)]
-                if res.ndim > 1:
-                    res = res.head(1).squeeze()
-                if len(res.shape) != 1:
-                    print(
-                        "Not 1-dimensional",
-                        res.shape,
-                        res,
-                        mtf.loc[(row.image_id, row.association)],
-                        mtf.loc[(row.image_id, row.association)].head(1),
+            # TODO: All this checking can probably be removed now.
+            def printingExtract(row, mtf):
+                try:
+                    if mtf.index.size == 0:
+                        self.printToLog("Zero-length index", mtf.columns, res, sep="\n")
+                    res = mtf.loc[(row.image_id, row.association)]
+                    if res.ndim > 1:
+                        res = res.head(1).squeeze()
+                    if len(res.shape) != 1:
+                        self.printToLog(
+                            "Not 1-dimensional",
+                            res.shape,
+                            res,
+                            mtf.loc[(row.image_id, row.association)],
+                            mtf.loc[(row.image_id, row.association)].head(1),
+                            sep="\n\n",
+                        )
+
+                    return res  # mtf.loc[(row.image_id, row.association)]
+                except KeyError as e:
+                    self.printToLog(
+                        e, row.image_id, row.association, mtf, mtf.index, sep="\n"
+                    )
+                    raise e
+                except AttributeError as e:
+                    self.printToLog(
+                        e, row.image_id, row.association, mtf, mtf.index, sep="\n"
+                    )
+                    raise e
+
+            if not np.any(selector):
+                self.printToLog("\t\tNo matching annotations!")
+            else:
+                mtf = mergeTargetFrame.reset_index(level=0).sort_index()
+                targetAssociations = self.annoStore.annotations.loc[
+                    selector, ["image_id", "association"]
+                ].apply(
+                    printingExtract,  # lambda row, mtf: mtf.loc[(row.image_id, row.association)],
+                    axis=1,
+                    args=(mtf,),
+                )
+                try:
+                    self.annoStore.annotations.loc[
+                        selector, "association"
+                    ] = targetAssociations.target_association.to_numpy()
+                except AttributeError as e:
+                    self.printToLog(
+                        e,
+                        selector,
+                        np.flatnonzero(selector),
+                        mergeTargetFrame,
+                        targetAssociations,
+                        targetAssociations.iloc[0],
+                        self.annoStore.annotations.loc[
+                            selector, ["image_id", "association"]
+                        ],
                         sep="\n\n",
                     )
 
-                return res  # mtf.loc[(row.image_id, row.association)]
-            except KeyError as e:
-                print(e, row.image_id, row.association, mtf, mtf.index, sep="\n")
-                raise e
-            except AttributeError as e:
-                print(e, row.image_id, row.association, mtf, mtf.index, sep="\n")
-                raise e
-
-        if not np.any(selector):
-            print("No matches!")
-        else:
-            mtf = mergeTargetFrame.reset_index(level=0).sort_index()
-            targetAssociations = self.annoStore.annotations.loc[
-                selector, ["image_id", "association"]
-            ].apply(
-                printingExtract,  # lambda row, mtf: mtf.loc[(row.image_id, row.association)],
-                axis=1,
-                args=(mtf,),
-            )
-            try:
-                self.annoStore.annotations.loc[
-                    selector, "association"
-                ] = targetAssociations.target_association.to_numpy()
-            except AttributeError as e:
-                print(
-                    e,
-                    selector,
-                    np.flatnonzero(selector),
-                    mergeTargetFrame,
-                    targetAssociations,
-                    targetAssociations.iloc[0],
-                    self.annoStore.annotations.loc[
-                        selector, ["image_id", "association"]
-                    ],
-                    sep="\n\n",
-                )
-
-    def computeWorkerSkills(self, worker, verbose=False):
-        # worker annotations
+    def computeWorkerSkills(self, worker, onlyFinished=False, verbose=False):
+        # worker annotations - only keep new annotations as old ones are already
+        # counted in the prior.
         annos = worker.getAnnotations()
         annotationIndexLabels = worker.getAnnotationIndexLabels()
-        # worker annotations grouped by image
-        imageGroupedAnnos = annos.groupby(by="image_id")
-        # Images seen by this worker
-        workerImages = annos.image_id.unique()
-        # *All* annotations for images seen by this worker i.e. even if the
-        # worker left it blank.
-        workerImageAnnos = worker.annotationStore.annotations.loc[
-            pd.Index(self.annoStore.annotations["image_id"]).isin(workerImages)
-        ]
-        # Number of workers annotating each image
-        numWorkersPerImage = imageGroupedAnnos.worker_id.nunique()
 
-        # Workers are assigned a weight to account for the fact that they may
-        # be one of many or few that annotated the image. If their assessment
-        # agrees/disagrees with a large number of annotators then the
-        # increment/decrement to their skill is enhanced.
-        multiplicityWeights = ((numWorkersPerImage - 1) / numWorkersPerImage).rename(
-            "weights"
-        )
-        multiplicityWeights = multiplicityWeights.where(multiplicityWeights > 0, 1)
+        selector = None
+        if onlyFinished:
+            finishedImages = self.statStore.imageStatistics.index[
+                self.statStore.imageStatistics.is_finished
+            ].intersection(annos.image_id.unique())
+            selector = annos.image_id.isin(finishedImages)
+            # Selecting finished annos also guarantees that only finished
+            # images will be included later in workerImageAnnos.
+            annos = annos.loc[selector]
+            annotationIndexLabels = annotationIndexLabels[selector]
 
-        workerImageAnnos = workerImageAnnos.merge(
-            multiplicityWeights, how="left", left_on="image_id", right_index=True
-        )  # Now a copy detatched from annoStore
-
-        worker.annotationStore.annotations.loc[
-            annotationIndexLabels, "multiplicity_weights"
-        ] = workerImageAnnos.loc[annos.index, "weights"]
-
-        # Compute annotation statistics
-
-        # ** Common annotation counts
+        # ** Raw annotation counts
         numAnnos = annos.index.size
-        numWeightedAnnos = annos.multiplicity_weights.sum()
 
-        # ** False positives
-        numFalsePosAnnos = (
-            annos.multiplicity_weights * ~annos.matches_ground_truth
-        ).sum()
+        if numAnnos > 0:
+            # worker annotations grouped by image
+            imageGroupedAnnos = annos.groupby(by="image_id")
+            # Images seen by this worker
+            workerImages = annos.image_id.unique()
 
-        # ** False negatives
+            # *All* annotations for images seen by this worker i.e. even if the
+            # worker left it blank.
+            workerImageAnnos = worker.annotationStore.annotations.loc[
+                pd.Index(self.annoStore.annotations["image_id"]).isin(workerImages)
+            ]
+            # Number of workers annotating each image
+            numWorkersPerImage = workerImageAnnos.groupby(
+                by="image_id"
+            ).worker_id.nunique()
 
-        # Summed number of ground truth boxes in images seen by this worker
-        numGroundTruths = (
-            workerImageAnnos.is_ground_truth * workerImageAnnos.weights
-        ).sum()
-        # Summed number of annotations by this worker that match a ground truth
-        numMatchesGroundTruths = (
-            annos.multiplicity_weights * annos.matches_ground_truth
-        ).sum()
-        # The number they missed i.e. number available - number matched
-        numMissedGroundTruths = numGroundTruths - numMatchesGroundTruths
-        if numMissedGroundTruths < 0:
-            print(
-                "Warning! Apparently negative number of missed ground truths!\n",
-                f"{numGroundTruths}, {numMatchesGroundTruths}, {numMissedGroundTruths}",
+            # Workers are assigned a weight to account for the fact that they may
+            # be one of many or few that annotated the image. If their assessment
+            # agrees/disagrees with a large number of annotators then the
+            # increment/decrement to their skill is enhanced.
+            multiplicityWeights = (
+                (numWorkersPerImage - 1) / numWorkersPerImage
+            ).rename("weights")
+            multiplicityWeights = multiplicityWeights.where(
+                multiplicityWeights > 0, np.finfo(np.float64).tiny
             )
 
-        # ** Variances
-        deltaVariance = (
-            np.nansum(annos.ground_truth_distance ** 2)
-            + (
-                self.statStore.imageStatistics.loc[
-                    imageGroupedAnnos.groups.keys(), "variance"
-                ]  # This is why image params must be computed first!
-                * imageGroupedAnnos.matches_ground_truth.sum()
-            ).sum()
-        )
+            workerImageAnnos = workerImageAnnos.merge(
+                multiplicityWeights, how="left", left_on="image_id", right_index=True
+            )  # Now a second copy detatched from annoStore
 
-        # ** Save computed count and variance statistics for this worker
-        worker.incrementStatistics(
-            # the actual number of annotations
-            numAnnos,
-            # the effective number of trials that could yield false positive
-            numWeightedAnnos,
-            # the actual number of false positives
-            numFalsePosAnnos,
-            # the effective number of trials that could yield false negative
-            numGroundTruths,
-            # the actual number of false negatives
-            numMissedGroundTruths,
-            # the number of matched ground truths
-            numMatchesGroundTruths,
-            # the variance update appropriate for the matched ground truths
-            deltaVariance,
-        )
+            worker.annotationStore.annotations.loc[
+                annotationIndexLabels, "multiplicity_weights"
+            ] = workerImageAnnos.loc[annos.index.to_numpy(), "weights"]
+
+            # Reload updated annos
+            annos = worker.getAnnotations()
+            if onlyFinished:
+                annos = annos.loc[selector]
+
+            # Compute annotation statistics
+
+            # ** Weighted annotation counts
+            numWeightedAnnos = annos.multiplicity_weights.sum()
+
+            # ** False positives
+            numFalsePosAnnos = (
+                annos.multiplicity_weights * ~annos.matches_ground_truth
+            ).sum()
+
+            # ** False negatives
+
+            # Summed number of ground truth boxes in images seen by this worker
+            numGroundTruths = (
+                workerImageAnnos.is_ground_truth * workerImageAnnos.weights
+            ).sum()
+            # Summed number of annotations by this worker that match a ground truth
+            numMatchesGroundTruths = (
+                annos.multiplicity_weights
+                * annos.matches_ground_truth
+                * ~annos.is_merged
+            ).sum()
+            # The number they missed i.e. number available - number matched
+            numMissedGroundTruths = numGroundTruths - numMatchesGroundTruths
+            if numMissedGroundTruths < -1e-8:
+                self.printToLog(
+                    f"Worker {worker.workerId}.\n"
+                    "Apparently negative number of missed ground truths!\n",
+                    f"{numGroundTruths}, {numMatchesGroundTruths}, {numMissedGroundTruths}",
+                    logtype="warning",
+                )
+                if self.savePath is not None:
+                    filePath = os.path.join(
+                        self.savePath, f"worker_{worker.workerId}_nmgt.pkl"
+                    )
+                    with open(filePath, mode="wb") as nmgtFile:
+                        self.printToLog(
+                            f"Saving worker annotation data for worker {worker.workerId} to {filePath}.",
+                            logtype="warning",
+                        )
+                        pickle.dump(
+                            dict(
+                                annos=worker.getAnnotations(),
+                                image_annos=workerImageAnnos,
+                                finished_selector=selector,
+                            ),
+                            nmgtFile,
+                        )
+
+            # ** Variances
+            deltaVariance = (
+                np.nansum(annos.ground_truth_distance ** 2)
+                + (
+                    self.statStore.imageStatistics.loc[
+                        imageGroupedAnnos.groups.keys(), "variance"
+                    ]  # This is why image params must be computed first!
+                    * imageGroupedAnnos.matches_ground_truth.sum()
+                ).sum()
+            )
+
+            # ** Save computed count and variance statistics for this worker
+            worker.incrementStatistics(
+                # the actual number of annotations
+                numAnnos,
+                # the effective number of trials that could yield false positive
+                numWeightedAnnos,
+                # the actual number of false positives
+                numFalsePosAnnos,
+                # the effective number of trials that could yield false negative
+                numGroundTruths,
+                # the actual number of false negatives
+                numMissedGroundTruths,
+                # the number of matched ground truths
+                numMatchesGroundTruths,
+                # the variance update appropriate for the matched ground truths
+                deltaVariance,
+            )
+
+            # Log when a volunteer annotates more than 10 clumps in an image
+            # This might indicate a mistake.
+            if imageGroupedAnnos.size().max() > 10:
+                self.printToLog(
+                    f"Worker {worker.workerId}:",
+                    "Maximum marks/image > 10",
+                    imageGroupedAnnos.ngroups,
+                    imageGroupedAnnos.size().describe(),
+                    numAnnos,
+                    # the effective number of trials that could yield false positive
+                    numWeightedAnnos,
+                    # the actual number of false positives
+                    numFalsePosAnnos,  # * regularisingFactor,
+                    # the effective number of trials that could yield false negative
+                    numGroundTruths,
+                    # the actual number of false negatives
+                    numMissedGroundTruths,
+                    # the number of matched ground truths
+                    numMatchesGroundTruths,
+                    # the variance update appropriate for the matched ground truths
+                    deltaVariance,
+                    sep="\n",
+                    logtype="warning",
+                )
 
         # ** Now compute the required probabilities
         # Computations consider all prior information from initialisation and
@@ -956,7 +1154,7 @@ class BoxAggregator:
         # (note that weights are not included in variance computation)
         variance = worker.getVarianceNumerator() / worker.getNumVarianceTrials()
 
-        return falsePosProb, falseNegProb, variance
+        return falsePosProb, falseNegProb, variance, worker.workerId
 
     def computeWorkerSkills_old(self, worker, verbose=False):
         # worker annotations
@@ -1016,7 +1214,7 @@ class BoxAggregator:
         # The number they missed i.e. number available - number matched
         numMissedGroundTruths = numGroundTruths - numMatchesGroundTruths
         if numMissedGroundTruths < 0:
-            print(
+            self.printToLog(
                 "Warning! Apparently negative number of missed ground truths!\n",
                 f"{numGroundTruths}, {numMatchesGroundTruths}, {numMissedGroundTruths}",
             )
@@ -1120,12 +1318,12 @@ class BoxAggregator:
                         verbose=not init,
                     )
                 else:
-                    print(
+                    self.printToLog(
                         f"\t\t\tNo annotations provided for image {image.imageId}"
                         f" after {image.getNumAnnotations()} views."
                     )
             except KeyError as e:
-                print(imageIndex, image.imageId, e)
+                self.printToLog(imageIndex, image.imageId, e)
                 raise e
         # Step 4: Prune/merge isolated associations
         if not init:
@@ -1247,7 +1445,7 @@ class BoxAggregator:
             # Image part (image-based variance only)
             associationGroupedMatchingAnnos = matchingAnnos.groupby(by="association")
             groupImageVariances = associationGroupedMatchingAnnos.apply(
-                self.computeBoxImageVariance, image  ##HERE
+                self.computeBoxImageVariance, image
             )
             # Note: Association values refer to a single ground truth within the
             # context of a single image. We are considering annotations for a single
@@ -1315,10 +1513,11 @@ class BoxAggregator:
             imageGroupedAnnotations.groups.keys(),
         )
         # Step 2: Compute and store worker skill parameters and map to annotations
+        workerSkills = np.array(
+            [self.computeWorkerSkills(worker) for worker in self.workers]
+        )
         self.statStore.setWorkerSkills(
-            np.array(
-                [self.computeWorkerSkills(worker) for worker in self.workers]
-            )  ##HERE
+            workerSkills[:, :3], workers=workerSkills[:, 3].astype(int)
         )
         self.annoStore.annotations.false_pos_prob = self.statStore.workerStatistics.false_pos_prob.loc[
             self.annoStore.annotations.worker_id
@@ -1519,8 +1718,14 @@ class BoxAggregator:
         # Contributions from annotations that do not match a ground truth i.e.
         # false positives
         nonMatchingAnnos = imageAnnoData.loc[~imageAnnoData.matches_ground_truth]
-        ## TODO: Document this! Method of estimating number of true negatives?
-        # n_fp*log(p_fp) - n_fp*log(max_num)
+        # TODO: Document this! Method of estimating number of true negatives?
+        # If p_fp -> 0 then log(p_fp) -> -inf so allowing more possible ground
+        # truths subtracts a positive number and makes p_fp slightly smaller.
+
+        # if many ground truths are plausible then the chance that this worker
+        # is the first to annotate it is higher?
+
+        # n_fp*log(p_fp)
         falsePosLL = (
             np.log(nonMatchingAnnos.false_pos_prob)
             - np.log(self.datasetWidePriorParameters["shared"]["max_num_ground_truths"])
@@ -1641,36 +1846,105 @@ class BoxAggregator:
         )
 
     def processBatchStep(self, init=False):
-        print("\tComputing Associations...")
+        self.printToLog("\tComputing Associations...")
         self.computeBatchAssociations(init=init)
-        print("\tComputing Likelihood Parameters...")
+        self.printToLog("\tComputing Likelihood Parameters...")
         self.computeBatchLikelihoodParameters()
-        print("\tComputing Likelihood Model...")
+        self.printToLog("\tComputing Likelihood Model...")
         return self.computeBatchLikelihood()
 
-    def finaliseBatch(self):
-        print("Finalising batch")
+    def finaliseBatch(self, discardFinishedImageData=True):
+        self.printToLog("Finalising batch")
         # Find finished images.
         finishedImages = self.imageCompletionAssessor(
             self.statStore.imageStatistics, self.imageCompletionParams
         )
-        print(f"Found {finishedImages.sum()} finshed images.")
+        self.printToLog(
+            f"\tFound {finishedImages.sum() - self.finishedImageRunningTotal} new finished images."
+        )
+        self.finishedImageRunningTotal = finishedImages.sum()
+        self.printToLog(f"\t{self.finishedImageRunningTotal} finished images in total.")
+
         finishedImagesIndex = finishedImages.loc[finishedImages].index
-        # Remove all annotations for finished images
-        # Note that ImageViews and WorkerViews will be regenerated when new
-        # batch initialises.
-        self.annoStore.annotations = self.annoStore.annotations.loc[
-            ~self.annoStore.annotations.image_id.isin(finishedImagesIndex).to_numpy()
-        ]
-        # Explicitly clear statistic store caches
-        self.statStore.clearCache()
+
         # Update image statistic store to register that images are finished.
         # This will allow future classifications for these images to be
         # discarded in offline mode if desired.
         # Since worker statistics are not reset at the end of a batch, their
         # skill statistics will reflect images that are removed from the
         # pool.
-        self.statStore.imageStatistics.loc[finishedImagesIndex, "finished"] = True
+        self.statStore.imageStatistics.loc[
+            finishedImagesIndex, ["is_finished", "finish_criterion"]
+        ] = [True, "completion_assessor"]
+
+        # For remaining images increment the number of batches they have remained
+        # unfinished.
+        self.statStore.imageStatistics.loc[
+            ~self.statStore.imageStatistics.is_finished, "num_batches_not_finished"
+        ] += 1
+
+        # Retire any images that have remained unfinished for more batches than
+        # the user-specified threshold.
+        maxBatchSelector = ~self.statStore.imageStatistics.is_finished & (
+            self.statStore.imageStatistics.num_batches_not_finished
+            > self.imageCompletionParams["max_num_batches_not_finished"]
+        )
+        numStaleImages = maxBatchSelector.sum()
+        if numStaleImages > 0:
+            self.printToLog(
+                f"{numStaleImages} images set finished "
+                f"after {self.imageCompletionParams['max_num_batches_not_finished']} "
+                "batches without finishing"
+            )
+        self.statStore.imageStatistics.loc[
+            maxBatchSelector, ["is_finished", "finish_criterion"]
+        ] = [True, "max_batches_exceeded"]
+
+        # Save all information required to reconstruct clump locations for
+        # all finished images. Also save settings for this run.
+        if self.savePath is not None:
+            finalSavePath = os.path.join(
+                self.savePath, f"batch_{self.batchCounter}_final.pkl"
+            )
+            self.printToLog(f"Saving finalised state to {finalSavePath}...")
+            self.saveStores(finalSavePath)
+            self.saveSettings(os.path.join(self.savePath, f"settings.pkl"))
+
+        # The prior worker skill values for the next batch should be based only
+        # on images that are finished. Unfinished images will be revisited and
+        # detected box solutions (and therefore false pos/neg counts) may change.
+        self.printToLog(
+            "\tSetting worker skill priors using only finished image data..."
+        )
+        self.statStore.restoreCachedWorkers()
+        workerSkills = np.array(
+            [
+                self.computeWorkerSkills(worker, onlyFinished=True)
+                for worker in self.workers
+            ]
+        )
+        self.statStore.setWorkerSkills(
+            workerSkills[:, :3], workers=workerSkills[:, 3].astype(int)
+        )
+
+        # Remove all annotations for finished images and mark annotations
+        # from unfinished images.
+        # Note that ImageViews and WorkerViews will be regenerated when new
+        # batch initialises.
+
+        if discardFinishedImageData:
+            finishedImagesIndex = self.statStore.imageStatistics.loc[
+                self.statStore.imageStatistics.is_finished
+            ].index
+            self.printToLog("\tDiscarding annotations for finished images...")
+            self.annoStore.annotations = self.annoStore.annotations.loc[
+                ~self.annoStore.annotations.image_id.isin(
+                    finishedImagesIndex
+                ).to_numpy()
+            ].copy()
+        self.annoStore.annotations.is_from_earlier_batch = True
+        # Explicitly clear statistic store caches
+        self.statStore.clearCache()
 
     def computeImageExpNumFalseNegative(self, imageAnnotations, grouper):
         # Can only compute false negative probability using data for this image
@@ -1681,9 +1955,10 @@ class BoxAggregator:
 
             fcPairs = np.array(list(itertools.product(facilities, cities)))
             try:
+                # Boxes canot connect to themselves.
                 fcPairs = fcPairs[fcPairs[:, 0] != fcPairs[:, 1]].T
             except IndexError as e:
-                print(e, fcPairs.shape, cities.shape, facilities.shape)
+                self.printToLog(e, fcPairs.shape, cities.shape, facilities.shape)
 
             imageAnnotationIndices = grouper.indices[imageAnnotations.name]
             # Add 1 since costs and connection mask *do* have rows/columns for the dummy
@@ -1766,15 +2041,15 @@ class BoxAggregator:
         # The global set approximates the probability that any position in any
         # image contains a target object e.g. all likely targets may be
         # concentrated in the centre of the image.
-
+        #
         # Every global box that doesn't intersect with a ground truth box for
         # this image increases the probability that there is a real box missing
         # from the current ground truth estimate.
-
+        #
         # If the cost of identifying the ground truth box as a target was high,
         # then this reduces the chance that the missed intersection implies a
         # missed target.
-
+        #
         # Recall that the cost is the sum of negated log false negative
         # probabilities over all workers who annotated the image corresponding
         # to a particluar box i.e. a higher cost implies many workers with a
@@ -1841,7 +2116,6 @@ class BoxAggregator:
 
         # Compute a set of workers who saw the image and had an opportunity
         # to mark the ground truth
-        # BUG. Should this be all annos for images with matches, not just matching?
         possibleWorkers = self.annoStore.annotations.groupby(
             by="image_id"
         ).worker_id.apply(set)
@@ -1858,7 +2132,8 @@ class BoxAggregator:
         combinedWorkers["worker_id_missed"] = (
             combinedWorkers.worker_id_possible - combinedWorkers.worker_id_matched
         )
-        # Retrieve the false positive probabilities for workers that missed each ground truth
+        # Retrieve the false negative probabilities for workers that missed each
+        # ground truth
         combinedWorkers[
             "false_neg_prob_missed"
         ] = combinedWorkers.worker_id_missed.apply(
@@ -1949,7 +2224,7 @@ class BoxAggregator:
         for each box associated with the ground truth.
 
         In this case, the probability that the error associated with the ground truth box
-        position exceeds $\pm \delta$ is given by $\mathrm{erfc}\left(\frac{\delta}{\sqrt{2\sigma^{2}}}\right)$.
+        position exceeds $\pm \delta$ is given by $1-\mathrm{erfc}\left(\frac{\delta}{\sqrt{2\sigma^{2}}}\right)$.
 
         Note that the variances are expressed in 1-IoU coordinates and are therefore bounded in the range $[0,1]$
         """
@@ -2004,21 +2279,23 @@ class BoxAggregator:
 
     def computeRisks(self):
         # Step 6: Compute risks for all images.
-        print("\tComputing risks...")
+        self.printToLog("\tComputing risks...")
         # Step 6a: Compute expected number of false negatives for all images.
-        print("\t\tComputing per-image expected false negative counts...")
+        self.printToLog("\t\tComputing per-image expected false negative counts...")
         self.computeExpNumFalseNegative()
 
         # Step 6b: Compute expected number of false positives for all images.
-        print("\t\tComputing per-image expected false positive counts...")
+        self.printToLog("\t\tComputing per-image expected false positive counts...")
         gtFalsePosProbs = self.computeExpNumFalsePositive(
             singleBoxFilterThreshold=self.lossParams["single_box_filter_threshold"]
         )
 
         # Step 6c: Compute expected variance of (assumed) true positive annotations.
-        print("\t\tComputing per-image expected inaccurate positive counts...")
+        self.printToLog(
+            "\t\tComputing per-image expected inaccurate positive counts..."
+        )
         gtInaccurateProbs = self.computeExpNumInaccurate()
-        # print(gtInaccurateProbs, gtFalsePosProbs, sep="\n\n")
+        # self.printToLog(gtInaccurateProbs, gtFalsePosProbs, sep="\n\n")
 
         # Step 6d: Compute individual ground truth box risks
         groundTruthRisks = self.lossParams["false_pos_loss"] * (
@@ -2065,19 +2342,24 @@ class BoxAggregator:
         # Step 6g: Save per image risks
         self.statStore.setImageRisk(imageRisks, imageRisks.index)
 
-    def processBatch(self, dataBatch, stopEarlyAfterStep=None):
+    def processBatch(
+        self, dataBatch, stopEarlyAfterStep=None, discardFinishedImageData=True
+    ):
         self.setupNewBatch(dataBatch)
 
         # ** Once-per-batch computations
         # Step 1: Compute 1-IOU distances between all annotations in normalised coordinates
-        print("Computing IoU distances...")
+        self.printToLog("Computing IoU distances...")
         self.distances = self.imageProcessor.getIouDistances(
             store=self.annoStore, shuffle=False
         )
         # Step 2: Compute initial disallowed connection mask for all annotations
-        print("Computing initial disallowed connection mask...")
+        self.printToLog("Computing initial disallowed connection mask...")
         exclusiveIndexSetSizes = (
-            self.annoStore.getMultiIndexGroupedAnnotations().count().iloc[:, 0].values
+            self.annoStore.getMultiIndexGroupedAnnotations(rebuild=True)
+            .count()
+            .iloc[:, 0]
+            .values
         )
         exclusiveIndices = np.concatenate(
             list(self.annoStore.getMultiIndexGroupedAnnotations().indices.values())
@@ -2093,8 +2375,8 @@ class BoxAggregator:
         )
         # Step 3: Compute global box overlap statistics for later use computing
         # risk.
-        print("Computing global box overlap statistics...")
-        # Note this is not inefficient since we are just shuffling previously
+        self.printToLog("Computing global box overlap statistics...")
+        # Note this is *not* inefficient since we are just shuffling previously
         # computed distances
         shuffledDistances, shuffledIndex = self.imageProcessor.getIouDistances(
             store=None, shuffle=True
@@ -2107,9 +2389,29 @@ class BoxAggregator:
             < self.initPhaseParameters["required_overlap_fraction"]
         )
 
-        # Count the number of random overlaps between boxes in the shuffled set
-        # by computing the projected sum along either axis.
-        randomOverlapCounts = overlaps.sum(axis=0)
+        # Search for groups of boxes that obverlap in normalised image
+        # coordinate space.
+        randomOverlapCounts = collections.OrderedDict({})
+
+        for newBox in overlaps.index:
+            overlapFound = False
+            for knownBox in randomOverlapCounts.keys():
+                if overlaps.loc[knownBox, newBox]:
+                    # If the box being considered overlaps with one that has
+                    # already been processed then increment the overlap
+                    # count of the *previous* box.
+                    randomOverlapCounts[knownBox] += 1
+                    overlapFound = True
+                    break
+            # After comparing with all previous boxes.
+            else:
+                if not overlapFound:
+                    # If the box being considered does not overlap with one
+                    # that has already been processed then increment add this
+                    # box to the list for future comparisons.
+                    randomOverlapCounts[newBox] = 0
+
+        randomOverlapCounts = pd.Series(randomOverlapCounts)
 
         # The random false positive probability is the number of random overlaps
         # divided by the number of distinct annotations i.e. unique, non-empty
@@ -2137,17 +2439,22 @@ class BoxAggregator:
 
         # Step 4:
         # ** Initial batch processing
-        print("Initial batch processing...")
+        self.printToLog("Initial batch processing...")
         self.statStore.cacheWorkers()
         self.statStore.cacheImages()
+        self.statStore.resetAssociatedBoxes()
+        self.statStore.resetGroundTruths()
+
         self.processBatchStep(init=True)
         if self.computeStepwiseRisks:
             self.computeRisks()
         if self.savePath is not None:
-            self.saveStores(os.path.join(self.savePath, f"init.pkl"))
+            self.saveStores(
+                os.path.join(self.savePath, f"batch_{self.batchCounter}_init.pkl")
+            )
 
         if stopEarlyAfterStep == "init":
-            print(f"Stopping early after init.")
+            self.printToLog(f"Stopping early after init.")
             return
 
         self.statStore.restoreCachedWorkers()
@@ -2155,54 +2462,52 @@ class BoxAggregator:
 
         # Step 5:
         # ** Expectation maximisation
-        currentLikelihood = -np.inf
-        previousLikelihood = -np.inf
-        for batchStep in range(10):
-            print(f"Batch processing iteration {batchStep}...")
+        currentLikelihood = np.inf
+        previousLikelihood = np.inf
+        for batchStep in range(self.maxBatchIterations):
+            self.printToLog(f"Batch processing iteration {batchStep}...")
             self.statStore.resetAssociatedBoxes()
             self.statStore.resetGroundTruths()
             self.statStore.cacheWorkers()
             self.statStore.cacheImages()
+
             currentLikelihood = self.processBatchStep(init=False)
             # Store record of likelihood value for this iteration
             self.likelihoods.append(currentLikelihood)
             if self.computeStepwiseRisks:
                 self.computeRisks()
             if self.savePath is not None:
-                stepSavePath = os.path.join(self.savePath, f"step_{batchStep}.pkl")
+                stepSavePath = os.path.join(
+                    self.savePath, f"batch_{self.batchCounter}_step_{batchStep}.pkl"
+                )
                 self.saveStores(stepSavePath)
-            if currentLikelihood <= previousLikelihood:
-                print(f"Converged @ {currentLikelihood}")
+            if currentLikelihood >= previousLikelihood:
+                self.printToLog(f"Converged @ {currentLikelihood}")
                 break
             elif stopEarlyAfterStep == batchStep:
-                print(
+                self.printToLog(
                     f"Stopping early after step {batchStep}. Likelihood @ {currentLikelihood}"
                 )
                 break
             else:
-                print(
+                self.printToLog(
                     f"Not Converged @ {currentLikelihood} (Previous: {previousLikelihood})"
                 )
                 previousLikelihood = currentLikelihood
 
-                # Restore cached worker/image statistics
-                self.statStore.restoreCachedWorkers()
-                self.statStore.restoreCachedImages()
+                if batchStep < self.maxBatchIterations - 1:
+                    # Restore cached worker/image statistics
+                    self.statStore.restoreCachedWorkers()
+                    self.statStore.restoreCachedImages()
 
         if not self.computeStepwiseRisks:
             self.computeRisks()
 
         # Determine finished images, cleanup and persistence operations.
-        self.finaliseBatch()
-
-        if self.savePath is not None:
-            finalSavePath = os.path.join(self.savePath, f"final.pkl")
-            print(f"Moving last saved state from  {stepSavePath} to {finalSavePath}...")
-            os.rename(stepSavePath, finalSavePath)
-            self.saveSettings(os.path.join(self.savePath, f"settings.pkl"))
+        self.finaliseBatch(discardFinishedImageData=discardFinishedImageData)
 
     def saveStores(self, savePath):
-        print(f"Saving state to {savePath}...")
+        self.printToLog(f"Saving state to {savePath}...")
         saveable = dict(
             annotations=self.annoStore.getSaveable(),
             statistics=self.statStore.getSaveable(),
@@ -2211,7 +2516,7 @@ class BoxAggregator:
             pickle.dump(saveable, saveFile)
 
     def saveSettings(self, savePath):
-        print(f"Saving settings to {savePath}...")
+        self.printToLog(f"Saving settings to {savePath}...")
         saveable = dict(
             datasetWidePriorInitialValues=self.datasetWidePriorInitialValues,
             datasetWidePriorParameters=self.datasetWidePriorParameters,

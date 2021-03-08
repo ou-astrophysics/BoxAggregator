@@ -14,7 +14,8 @@ class StatisticStore(SaveableStore):
         "associatedBoxStatistics",
     ]
 
-    def __init__(self):
+    def __init__(self, logFunction=print):
+        self.logFunction = logFunction
         self.workerStatistics = pd.DataFrame()
         self.imageStatistics = pd.DataFrame()
 
@@ -145,6 +146,8 @@ class StatisticStore(SaveableStore):
                         ]
                         * priors["image_difficulty"]["variance"],
                         is_finished=False,
+                        finish_criterion="none",
+                        num_batches_not_finished=0,
                     )
                 ).set_index("image_id"),
             ]

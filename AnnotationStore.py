@@ -16,7 +16,8 @@ class AnnotationStore(SaveableStore):
         "multiIndexGroupedAnnotations",
     ]
 
-    def __init__(self, indexCols=["image_id", "worker_id"]):
+    def __init__(self, indexCols=["image_id", "worker_id"], logFunction=print):
+        self.logFunction = logFunction
         self.indexCols = indexCols
         self.annotations = pd.DataFrame()
         self.indices = None
@@ -48,22 +49,19 @@ class AnnotationStore(SaveableStore):
             Description of returned object.
 
         """
+        self.logFunction(f"Adding new annotations...")
         finished = pd.Index([])
+        # Remove any new annotations for images that are already finished.
+        # Should be very few if automatic retirement is running.
+        self.logFunction(f"\t{annotations.index.size} new annotations provided.")
         if statisticStore.imageStatistics.index.size > 0:
+            self.logFunction("\t\tFiltering annotations for previously finished images")
             finished = statisticStore.imageStatistics.loc[
-                :, statisticStore.imageStatistics.is_finished
+                statisticStore.imageStatistics.is_finished.to_numpy()
             ].index
             annotations = annotations.groupby(by="image_id").filter(
                 lambda grp: grp.name not in finished
             )
-
-        # Set worker skills for relevant annotations
-        if statisticStore.workerStatistics.index.size > 0:
-            skillParameterColumns = ["variance", "false_pos_prob", "false_neg_prob"]
-            annotations = annotations.copy(deep=True).set_index("worker_id")
-            annotations.loc[
-                statisticStore.workerStatistics.index, skillParameterColumns
-            ] = statisticStore.workerStatistics[skillParameterColumns]
 
         self.annotations = pd.concat(
             [
@@ -89,7 +87,7 @@ class AnnotationStore(SaveableStore):
                                 variance=priors["volunteer_skill"]["variance"],
                                 combined_variance=priors["shared"]["variance"],
                                 variance_weighting=0.5,  # balance between worker and image variance
-                                association=None,
+                                association=-1, # initialise connected to the dummy
                                 connection_cost=np.nan,
                                 is_ground_truth=False,
                                 is_cleanup_ground_truth=False,
@@ -99,14 +97,33 @@ class AnnotationStore(SaveableStore):
                                 matches_ground_truth=False,
                                 ground_truth_distance=np.nan,
                                 multiplicity_weights=1,
+                                is_from_earlier_batch=False,
                             ),
                             index=annotations.index,
                         ),
                     ],
                     axis=1,
                 ),
-            ]
+            ], ignore_index=True
         )
+        self.logFunction(f"\t{annotations.index.size} new annotations loaded.")
+        self.logFunction(f"\tTotal annotation count is now {self.annotations.index.size}.")
+
+        # Set worker skills for relevant annotations
+        if statisticStore.workerStatistics.index.size > 0:
+            knownWorkers = statisticStore.workerStatistics.index.intersection(
+                annotations.worker_id.unique()
+            )
+            if knownWorkers.size > 0:
+                self.logFunction(f"\tDetected {knownWorkers.size} returning workers...")
+                skillParameterColumns = ["variance", "false_pos_prob", "false_neg_prob"]
+                self.annotations.set_index("worker_id", inplace=True)
+
+                self.annotations.loc[
+                    knownWorkers, skillParameterColumns
+                ] = statisticStore.workerStatistics.loc[knownWorkers, skillParameterColumns]
+
+                self.annotations.reset_index(inplace=True)
 
         self.indices = {
             indexCol: self.annotations.groupby(by=indexCol).indices
