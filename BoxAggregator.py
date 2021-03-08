@@ -840,7 +840,9 @@ class BoxAggregator:
                     index=mergeLists.index,
                 ).rename("filtered_merge_list")
             except Exception as e:
-                self.printToLog( "Exception filtering ground truth merge lists...", e,
+                self.printToLog(
+                    "Exception filtering ground truth merge lists...",
+                    e,
                     mergeLists.reset_index()
                     .apply(
                         # The column name
@@ -849,8 +851,10 @@ class BoxAggregator:
                         ],
                         axis=1,
                     )
-                    .to_numpy(), mergeLists,
-                    logtype="warning", sep="\n"
+                    .to_numpy(),
+                    mergeLists,
+                    logtype="warning",
+                    sep="\n",
                 )
 
             # Collect all information required for merge
@@ -875,6 +879,10 @@ class BoxAggregator:
 
             # If there are no merge candidates, stop here
             if np.all(finalMergeLists.merge_list_empty):
+                self.printToLog(
+                    "\t\tmergeGroundTruths: After filtering, no"
+                    + " merge candidates remain"
+                )
                 return
             elif "mergee_association" not in finalMergeLists.columns:
                 self.printToLog("\t\tmergeGroundTruths: No mergee_association")
@@ -951,6 +959,11 @@ class BoxAggregator:
             if not np.any(selector):
                 self.printToLog("\t\tNo matching annotations!")
             else:
+                self.printToLog(
+                    f"\t\tmergeGroundTruths: {selector.sum()} merge "
+                    + "candidates remaining"
+                )
+
                 mtf = mergeTargetFrame.reset_index(level=0).sort_index()
                 targetAssociations = self.annoStore.annotations.loc[
                     selector, ["image_id", "association"]
@@ -960,9 +973,26 @@ class BoxAggregator:
                     args=(mtf,),
                 )
                 try:
+                    exampleTargets = self.annoStore.annotations.loc[
+                        selector, "association"
+                    ]
+                    self.printToLog(
+                        "\t\tmergeGroundTruths: Merging "
+                        + f"{len(exampleTargets)} ground truth boxes to "
+                        + f"{len(exampleTargets.unique())} targets"
+                    )
+                    # self.printToLog(f"{exampleTargets} -> ")
+                    # self.printToLog(
+                    #     f"{targetAssociations.target_association.to_numpy()}"
+                    # )
                     self.annoStore.annotations.loc[
                         selector, "association"
                     ] = targetAssociations.target_association.to_numpy()
+                    # exampleTargets = self.annoStore.annotations.loc[
+                    #     selector, "association"
+                    # ]
+                    # self.printToLog("\t\tmergeGroundTruths: Post-merge")
+                    # self.printToLog(f"{exampleTargets}")
                 except AttributeError as e:
                     self.printToLog(
                         e,
