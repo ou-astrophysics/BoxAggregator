@@ -9,7 +9,6 @@ setuptools.setup(
         "numpy",
         "pandas",
         "scipy",
-        "FacilityLocation @ git+ssh://github.com/ou-escape-eco/FacilityLocation@master",
-    ],
-    dependency_links=["https://github.com/ou-escape-eco/FacilityLocation.git"],
+        "FacilityLocation @ git+ssh://git@github.com/ou-escape-eco/FacilityLocation@master",
+    ]
 )
