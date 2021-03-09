@@ -2305,6 +2305,7 @@ class BoxAggregator:
             expectedNumInaccurate, expectedNumInaccurate.index
         )
 
+        groundTruthInaccurateProbs.index.set_names(["image_id", "association"])
         return groundTruthInaccurateProbs.rename("inaccurate_prob")
 
     def computeRisks(self):
