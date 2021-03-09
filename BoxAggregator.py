@@ -2306,7 +2306,7 @@ class BoxAggregator:
         )
 
         groundTruthInaccurateProbs = groundTruthInaccurateProbs.rename("inaccurate_prob").to_frame()
-        groundTruthInaccurateProbs.index.set_names(["image_id", "association"])
+        groundTruthInaccurateProbs.index.set_names(["image_id", "association"], inplace=True)
         return groundTruthInaccurateProbs
 
     def computeRisks(self):
