@@ -2305,9 +2305,9 @@ class BoxAggregator:
             expectedNumInaccurate, expectedNumInaccurate.index
         )
 
-        groundTruthInaccurateProbs = groundTruthInaccurateProbs.to_frame()
+        groundTruthInaccurateProbs = groundTruthInaccurateProbs.rename("inaccurate_prob").to_frame()
         groundTruthInaccurateProbs.index.set_names(["image_id", "association"])
-        return groundTruthInaccurateProbs.rename("inaccurate_prob")
+        return groundTruthInaccurateProbs
 
     def computeRisks(self):
         # Step 6: Compute risks for all images.
