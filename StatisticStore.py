@@ -256,9 +256,13 @@ class StatisticStore(SaveableStore):
     # Intended for use with multiple batches when finished image ground truths
     # should not be erased. Probably not correct.
     def setGroundTruths(self, groundTruthData):
-        newImageIds = pd.Index(groundTruthData.image_id.unique()).difference(
-            self.groundTruthStatistics.index.get_level_values(level=0)
-        )
+        try:
+            newImageIds = pd.Index(groundTruthData.image_id.unique()).difference(
+                self.groundTruthStatistics.index.get_level_values(level=0)
+            )
+        except AttributeError as e:
+            print(e, groundTruthData, sep="\n")
+            raise
 
         # find and remove any images for which the ground truth is being replaced.
         if self.groundTruthStatistics.size > 0:
