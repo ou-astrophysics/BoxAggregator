@@ -2333,7 +2333,7 @@ class BoxAggregator:
         groundTruthRisks = self.lossParams["false_pos_loss"] * (
             gtFalsePosProbs.false_pos_prob
             + (
-                gtInaccurateProbs
+                gtInaccurateProbs.inaccurate_prob
                 # TODO: What is this weighting all about?
                 * (
                     self.lossParams["false_neg_loss"]
