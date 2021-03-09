@@ -2305,6 +2305,7 @@ class BoxAggregator:
             expectedNumInaccurate, expectedNumInaccurate.index
         )
 
+        groundTruthInaccurateProbs = groundTruthInaccurateProbs.to_frame()
         groundTruthInaccurateProbs.index.set_names(["image_id", "association"])
         return groundTruthInaccurateProbs.rename("inaccurate_prob")
 
@@ -2345,7 +2346,7 @@ class BoxAggregator:
         ).rename("risk")
 
         # Step 6e: Save individual ground truth box statistics
-        print(gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks, sep="\n\n")
+        print("***", gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks, sep="\n\n")
         self.statStore.setGroundTruths(
             pd.concat(
                 [gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks], axis=1
