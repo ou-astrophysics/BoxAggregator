@@ -2344,6 +2344,7 @@ class BoxAggregator:
         ).rename("risk")
 
         # Step 6e: Save individual ground truth box statistics
+        print(gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks, sep="\n\n")
         self.statStore.setGroundTruths(
             pd.concat(
                 [gtFalsePosProbs, gtInaccurateProbs, groundTruthRisks], axis=1
