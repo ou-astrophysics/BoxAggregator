@@ -591,7 +591,7 @@ class BoxAggregator:
         Parameters
         ----------
         attemptMerge : bool
-            If true, search for ground truth boxesthat overlap and assign
+            If true, search for ground truth boxes that overlap and assign
             isolated boxes to that association.
             If False, assign the isolated box to the dummy and remove it from
             the ground truth set.
@@ -659,7 +659,8 @@ class BoxAggregator:
             # Prevent matching any boxes provided by the same worker for the same
             # image by setting the corresponding distance to infinity.
             self.printToLog(
-                f"\t\t\tDisallowing {mask.sum().sum()} merge candidates provided by the same worker for the same image"
+                f"\t\t\tDisallowing {mask.sum().sum()} merge candidates provided "
+                + "by the same worker for the same image"
             )
             # Mask replaces anywhere disallowed >= 1
             distances = distances.mask(mask, np.infty)
@@ -687,9 +688,19 @@ class BoxAggregator:
                         [
                             closest,
                             pd.Series(
-                                self.distances.lookup(
-                                    *(closest.reset_index(level=1).to_numpy().T)
-                                ),
+                                # verbose replacement for deprecated lookup
+                                # method
+                                self.distances.loc[
+                                    matchable[matchable].index.to_list(),
+                                    associated.to_list(),
+                                ]
+                                .melt(ignore_index=False)
+                                .set_index("variable", append=True)
+                                .loc[
+                                    closest.reset_index(level=1).to_numpy().tolist(),
+                                    "value",
+                                ]
+                                .to_numpy(),
                                 index=closest.index,
                             ),
                         ],
@@ -2305,8 +2316,12 @@ class BoxAggregator:
             expectedNumInaccurate, expectedNumInaccurate.index
         )
 
-        groundTruthInaccurateProbs = groundTruthInaccurateProbs.rename("inaccurate_prob").to_frame()
-        groundTruthInaccurateProbs.index.set_names(["image_id", "association"], inplace=True)
+        groundTruthInaccurateProbs = groundTruthInaccurateProbs.rename(
+            "inaccurate_prob"
+        ).to_frame()
+        groundTruthInaccurateProbs.index.set_names(
+            ["image_id", "association"], inplace=True
+        )
         return groundTruthInaccurateProbs
 
     def computeRisks(self):
