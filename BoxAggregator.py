@@ -678,11 +678,24 @@ class BoxAggregator:
                 .get_group(grp.name)
                 .idxmin(axis=0)
             )
+
+            # if there is exactly one image with a mergeable isolated boxes
+            # then rawClosest is a DataFrame and must be unstacked to yield
+            # a Series. After unstacking the resultant index levels are swapped.
+            if rawClosest.ndim > 1:
+                rawClosest = rawClosest.unstack().swaplevel()
+
+            # Identify any non-overlapping merge candidates. False implies that
+            # the match is disallowed. Re-use the mask identifier.
+            mask = rawClosest.to_frame().apply(
+                lambda x: np.isfinite(distances.loc[x.name[1], x.loc[0]]), axis=1
+            )
             try:
-                closest = rawClosest.loc[np.isfinite(rawClosest)]
+                closest = rawClosest.loc[mask]
             except ValueError as e:
                 print(e, rawClosest, sep="\n")
             if closest.shape[0] > 0:
+                # Get the distances between remaining merge candidates
                 matchCandidates = (
                     pd.concat(
                         [
@@ -722,12 +735,15 @@ class BoxAggregator:
                     self.printToLog(f"\t\tNo viable merge candidates found.")
 
                 # Correct associations appropriately
+                # Handle general cases
                 self.annoStore.annotations.loc[
                     matchCandidates.isolated.to_list(), "is_pruned"
                 ] = True
                 self.annoStore.annotations.loc[
                     matchCandidates.isolated.to_list(), "prune_distance"
                 ] = matchCandidates.distance.to_numpy()
+
+                # Handle cases that were merged
                 self.annoStore.annotations.loc[
                     matchCandidates[matchCandidates.overlaps].isolated.to_list(),
                     "is_merged",
@@ -748,6 +764,7 @@ class BoxAggregator:
                     "matches_ground_truth",
                 ] = True
 
+                # Handle the cases that were not merged
                 self.annoStore.annotations.loc[
                     matchCandidates[~matchCandidates.overlaps].isolated.to_list(),
                     "association",
@@ -762,7 +779,11 @@ class BoxAggregator:
                 ] = False
                 return
             else:
+                # the allowed list of merge candidates (before distance cut)
+                # was empty.
                 self.printToLog(f"\t\tNo viable merge candidates found.")
+                # Fall through to final if clause and clean up any isolated
+                # boxes that couldn't be merged.
         if isolated.size > 0:
             self.printToLog("\t\tAssigning isolated boxes to the dummy...")
             self.annoStore.annotations.loc[isolated, "is_pruned"] = True
