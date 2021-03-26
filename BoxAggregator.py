@@ -19,6 +19,7 @@ from ImageProcessor import ImageProcessor
 from ImageView import ImageView
 from WorkerView import WorkerView
 
+__version__ = "0.0.2"
 
 @numba.jit(nopython=True, cache=True)
 def computeIouDistancesAsymm(normedGtBoxCoords, normedBoxCoords):
