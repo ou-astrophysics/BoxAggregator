@@ -699,7 +699,10 @@ class BoxAggregator:
                 matchCandidates = (
                     pd.concat(
                         [
+                            # provides the index and merge candidates
                             closest,
+                            # provides the distances between the merge
+                            # candidates
                             pd.Series(
                                 # verbose replacement for deprecated lookup
                                 # method
@@ -720,6 +723,7 @@ class BoxAggregator:
                         axis=1,
                     )
                     .reset_index(level=1)
+                    # make the column names meaningful!
                     .rename(
                         columns={0: "closest", 1: "distance", "level_1": "isolated"}
                     )
