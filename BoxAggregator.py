@@ -21,6 +21,7 @@ from WorkerView import WorkerView
 
 __version__ = "0.0.2"
 
+
 @numba.jit(nopython=True, cache=True)
 def computeIouDistancesAsymm(normedGtBoxCoords, normedBoxCoords):
 
@@ -694,7 +695,16 @@ class BoxAggregator:
             try:
                 closest = rawClosest.loc[mask]
             except ValueError as e:
-                print(e, rawClosest, mask, sep="\n")
+                print(
+                    e,
+                    rawClosest,
+                    mask,
+                    mask.shape,
+                    type(mask),
+                    rawClosest.shape,
+                    type(rawClosest),
+                    sep="\n",
+                )
             if closest.shape[0] > 0:
                 # Get the distances between remaining merge candidates
                 matchCandidates = (
@@ -722,8 +732,7 @@ class BoxAggregator:
                             ),
                         ],
                         axis=1,
-                    )
-                    .reset_index(level=1)
+                    ).reset_index(level=1)
                     # make the column names meaningful!
                     .rename(
                         columns={0: "closest", 1: "distance", "level_1": "isolated"}
