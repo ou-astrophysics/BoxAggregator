@@ -694,7 +694,7 @@ class BoxAggregator:
             try:
                 closest = rawClosest.loc[mask]
             except ValueError as e:
-                print(e, rawClosest, sep="\n")
+                print(e, rawClosest, mask, sep="\n")
             if closest.shape[0] > 0:
                 # Get the distances between remaining merge candidates
                 matchCandidates = (
