@@ -699,7 +699,7 @@ class BoxAggregator:
                     closest = rawClosest.loc[mask]
                 except ValueError as e:
                     print(
-                        "Error computing nearby matches:"
+                        "Error computing nearby matches:",
                         e,
                         rawClosest,
                         mask,
@@ -2180,7 +2180,13 @@ class BoxAggregator:
         expNumFalseNegative.loc[noAssocImageIds] += self.noAssocBigBBoxMissContributions
 
         self.statStore.setImageExpNumFalseNegative(
-            expNumFalseNegative, expNumFalseNegative.index
+            expNumFalseNegative,
+            self.expNumFalseNegativeImage,
+            self.bigBBoxMissContributions,
+            self.noAssocBigBBoxMissContributions,
+            expNumFalseNegative.index,
+            self.bigBBoxMissContributions.index,
+            noAssocImageIds,
         )
 
     def computeExpNumFalsePositive(self, singleBoxFilterThreshold=None):
@@ -2277,6 +2283,8 @@ class BoxAggregator:
         # Compute the expected number of false positives for each image by summing
         # the contributions of each identified ground truth.
         filteredCombinedWorkers = combinedWorkers
+        # Anticipate making a cut on false pos prob and filter boxes with high
+        # P_fp so that they don't count towards the final risk
         if singleBoxFilterThreshold is not None:
             filteredCombinedWorkers = combinedWorkers.loc[
                 combinedWorkers.false_pos_prob < singleBoxFilterThreshold
@@ -2290,8 +2298,19 @@ class BoxAggregator:
             # .fillna(0)
         )
 
+        expNumFalsePositiveUnfiltered = (
+            combinedWorkers.reset_index()
+            .groupby(by=["image_id"])
+            .false_pos_prob.sum()
+            # .reindex(self.annoStore.annotations.image_id.unique())
+            # .fillna(0)
+        )
+
         self.statStore.setImageExpNumFalsePositive(
-            expNumFalsePositive, expNumFalsePositive.index
+            expNumFalsePositive,
+            expNumFalsePositiveUnfiltered,
+            expNumFalsePositive.index,
+            expNumFalsePositiveUnfiltered.index,
         )
 
         return combinedWorkers.loc[:, ["association", "false_pos_prob"]].set_index(

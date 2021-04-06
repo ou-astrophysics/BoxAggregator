@@ -134,7 +134,11 @@ class StatisticStore(SaveableStore):
                             "variance"
                         ],  # Expected variance of a ground truth box
                         expected_num_false_neg=0,
+                        expected_num_false_neg_image_contrib=0,
+                        expected_num_false_neg_global_contrib=0,
+                        expected_num_false_neg_empty_global_contrib=0,
                         expected_num_false_pos=0,
+                        expected_num_false_pos_unfiltered=0,
                         expected_num_inaccurate=0,
                         risk=np.infty,
                         open_cost=0,
@@ -168,15 +172,48 @@ class StatisticStore(SaveableStore):
     def setImageBoxVariances(self, variances, images=slice(None)):
         self.imageStatistics.loc[images, ["box_variance"]] = variances
 
-    def setImageExpNumFalseNegative(self, expNumFalseNegatives, images=slice(None)):
+    def setImageExpNumFalseNegative(
+        self,
+        expNumFalseNegatives,
+        expNumFalseNegativesImage,
+        globalMissContributions,
+        emptyGlobalMissContributions,
+        images=slice(None),
+        globalImages=slice(None),
+        emptyGlobalImages=slice(None),
+    ):
         self.imageStatistics.loc[
             images, ["expected_num_false_neg"]
         ] = expNumFalseNegatives
 
-    def setImageExpNumFalsePositive(self, expNumFalsePositives, images=slice(None)):
+        self.imageStatistics.loc[
+            images, ["expected_num_false_neg_image_contrib"]
+        ] = expNumFalseNegativesImage
+
+        self.imageStatistics.loc[
+            globalImages, ["expected_num_false_neg_global_contrib"]
+        ] = globalMissContributions
+
+        self.imageStatistics.loc[
+            emptyGlobalImages, ["expected_num_false_neg_empty_global_contrib"]
+        ] = emptyGlobalMissContributions
+
+
+
+    def setImageExpNumFalsePositive(
+        self,
+        expNumFalsePositives,
+        expNumFalsePositivesUnfiltered,
+        images=slice(None),
+        imagesUnfiltered=slice(None),
+    ):
         self.imageStatistics.loc[
             images, ["expected_num_false_pos"]
         ] = expNumFalsePositives
+
+        self.imageStatistics.loc[
+            imagesUnfiltered, ["expected_num_false_pos_unfiltered"]
+        ] = expNumFalsePositivesUnfiltered
 
     def setImageExpNumInaccurate(self, expNumInaccurate, images=slice(None)):
         self.imageStatistics.loc[images, ["expected_num_inaccurate"]] = expNumInaccurate
