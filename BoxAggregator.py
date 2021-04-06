@@ -19,7 +19,7 @@ from ImageProcessor import ImageProcessor
 from ImageView import ImageView
 from WorkerView import WorkerView
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 
 @numba.jit(nopython=True, cache=True)
