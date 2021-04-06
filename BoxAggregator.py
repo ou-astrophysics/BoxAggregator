@@ -692,20 +692,26 @@ class BoxAggregator:
             mask = rawClosest.to_frame().apply(
                 lambda x: np.isfinite(distances.loc[x.name[1], x.loc[0]]), axis=1
             )
-            try:
-                closest = rawClosest.loc[mask]
-            except ValueError as e:
-                print(
-                    e,
-                    rawClosest,
-                    mask,
-                    mask.shape,
-                    type(mask),
-                    rawClosest.shape,
-                    type(rawClosest),
-                    sep="\n",
-                )
-            if closest.shape[0] > 0:
+            if mask.empty:
+                closest = None
+            else:
+                try:
+                    closest = rawClosest.loc[mask]
+                except ValueError as e:
+                    print(
+                        "Error computing nearby matches:"
+                        e,
+                        rawClosest,
+                        mask,
+                        mask.shape,
+                        type(mask),
+                        rawClosest.shape,
+                        type(rawClosest),
+                        sep="\n",
+                    )
+                    # Unexpected issue - fallback to NoneType
+                    closest = None
+            if closest is not None and closest.shape[0] > 0:
                 # Get the distances between remaining merge candidates
                 matchCandidates = (
                     pd.concat(
